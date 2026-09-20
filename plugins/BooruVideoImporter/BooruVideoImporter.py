@@ -36,7 +36,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -68,6 +68,7 @@ _LAST_E621_ERIS = 0.0
 _LAST_RULE34 = 0.0
 _LAST_SAUCENAO = 0.0
 _SAUCENAO_SHORT_LIMIT = 4.0
+_ERIS_DISABLED_FOR_RUN = ""
 
 
 def _prefix(level: str) -> str:
@@ -224,10 +225,15 @@ def e621_eris_candidates(
     username: str,
     api_key: str,
 ) -> List[Tuple[float, str]]:
-    """Authenticated ERIS frame lookup. Anonymous heavy queries are intentionally skipped."""
-    global _LAST_E621_ERIS
-    if not (username and api_key):
+    """Authenticated ERIS frame lookup with a run-level Cloudflare circuit breaker.
+
+    ERIS is only a discovery fallback. Normal e621 post/MD5 API requests remain
+    enabled even when reverse-image frame uploads are blocked by Cloudflare.
+    """
+    global _LAST_E621_ERIS, _ERIS_DISABLED_FOR_RUN
+    if not (username and api_key) or _ERIS_DISABLED_FOR_RUN:
         return []
+
     _LAST_E621_ERIS = _wait(_LAST_E621_ERIS, 3.0)
     boundary = "----BooruVideoERISBoundary7MA4YWxkTrZu0gW"
     body = _multipart(
@@ -238,12 +244,35 @@ def e621_eris_candidates(
     )
     headers = e621_headers(username, api_key)
     headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-    payload = _json_request(
-        f"{E621_BASE}/iqdb_queries.json?v2=true",
-        headers=headers,
-        data=body,
-        timeout=60,
-    )
+
+    try:
+        payload = _json_request(
+            f"{E621_BASE}/iqdb_queries.json?v2=true",
+            headers=headers,
+            data=body,
+            timeout=60,
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        lowered = detail.casefold()
+        if (
+            "http 429" in lowered
+            or "just a moment" in lowered
+            or "cloudflare" in lowered
+            or "cf-chl-" in lowered
+        ):
+            _ERIS_DISABLED_FOR_RUN = (
+                "e621 ERIS returned an HTTP 429 / Cloudflare challenge"
+            )
+            log(
+                "WARNING",
+                "e621 ERIS frame search received HTTP 429/Cloudflare; "
+                "disabling ERIS frame uploads for the rest of this run. "
+                "SauceNAO and normal e621 API lookups will continue.",
+            )
+            return []
+        raise
+
     rows = payload if isinstance(payload, list) else (
         payload.get("results") if isinstance(payload, dict) else None
     )
@@ -780,14 +809,20 @@ def discover_candidates(
                 log("WARNING", f"SauceNAO video-frame lookup failed: {exc}")
                 had_error = True
 
-        if have_eris:
+        # SauceNAO is the primary frame locator. ERIS is only an e621 fallback
+        # when SauceNAO did not already identify an e621 post for this frame.
+        sauce_found_e621 = any(source == "e621" for source, _post_id in frame_hits)
+        if have_eris and not _ERIS_DISABLED_FOR_RUN and not sauce_found_e621:
             try:
                 for score, post_id in e621_eris_candidates(frame, username, api_key):
                     key = ("e621", post_id)
                     frame_hits[key] = max(frame_hits.get(key, 0.0), float(score))
             except Exception as exc:
                 log("WARNING", f"e621 ERIS video-frame lookup failed: {exc}")
-                had_error = True
+                # ERIS is optional when SauceNAO is configured. Without SauceNAO,
+                # a real ERIS failure makes this scan incomplete and retryable.
+                if not have_sauce:
+                    had_error = True
 
         for key, score in frame_hits.items():
             state = found.setdefault(key, {"hits": 0.0, "score": 0.0})
@@ -799,6 +834,12 @@ def discover_candidates(
         for (source, post_id), state in found.items()
     ]
     ranked.sort(key=lambda item: (item[2], item[3]), reverse=True)
+
+    # If ERIS was the only configured frame locator and Cloudflare blocked it,
+    # do not write a permanent No Match marker from an incomplete search.
+    if _ERIS_DISABLED_FOR_RUN and not have_sauce:
+        had_error = True
+
     return ranked[:MAX_CANDIDATES], had_error
 
 
