@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Separate scene/video reverse-search plugin for e621 and Rule34. Uses exact video MD5 first, then representative video frames to discover candidate posts, verifies candidate videos across multiple perceptual frame hashes, and imports authoritative metadata only after video verification.
-version: 1.0.0
+description: Separate scene/video reverse-search plugin for e621 and Rule34. Uses exact video MD5 first, SauceNAO-first frame discovery with a circuit-broken e621 ERIS fallback, verifies candidate videos across multiple perceptual frame hashes, and imports authoritative metadata only after video verification.
+version: 1.0.1
 
 exec:
   - python
