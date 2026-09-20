@@ -1,0 +1,60 @@
+name: Publish Booru Video Importer Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate plugin
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python -m compileall -q plugins/BooruVideoImporter
+          PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s plugins/BooruVideoImporter/tests -v
+
+      - name: Build release package
+        run: |
+          set -euo pipefail
+          VERSION="$(grep '^version:' plugins/BooruVideoImporter/BooruVideoImporter.yml | head -1 | awk '{print $2}')"
+          ASSET="Booru-Video-Importer-v${VERSION}.zip"
+
+          rm -rf release-package "$ASSET"
+          mkdir -p release-package/BooruVideoImporter
+          cp -a plugins/BooruVideoImporter/. release-package/BooruVideoImporter/
+          find release-package -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find release-package -type f -name '*.pyc' -delete
+
+          (
+            cd release-package
+            zip -r "../$ASSET" BooruVideoImporter >/dev/null
+          )
+
+          unzip -Z1 "$ASSET" | grep -qx 'BooruVideoImporter/BooruVideoImporter.yml'
+          unzip -Z1 "$ASSET" | grep -qx 'BooruVideoImporter/BooruVideoImporter.py'
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --title "Booru Video Importer v${VERSION}" \
+              --notes "Standalone Stash reverse-video importer for e621 and Rule34. Exact video hashes are checked first; deep search uses frame discovery and multi-frame video verification before metadata is imported."
+          fi
