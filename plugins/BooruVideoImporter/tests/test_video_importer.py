@@ -49,6 +49,49 @@ class VideoMatchTests(unittest.TestCase):
         self.assertFalse(result["review"])
         self.assertEqual(result["matched_frames"], 0)
 
+    def tearDown(self):
+        plugin._ERIS_DISABLED_FOR_RUN = ""
+
+    def test_eris_429_disables_only_reverse_image_fallback(self):
+        plugin._ERIS_DISABLED_FOR_RUN = ""
+        with mock.patch.object(
+            plugin,
+            "_json_request",
+            side_effect=RuntimeError(
+                "HTTP 429: <html><title>Just a moment...</title>Cloudflare</html>"
+            ),
+        ), mock.patch.object(plugin, "_wait", return_value=0.0), \
+             mock.patch.object(plugin, "log") as logger:
+            first = plugin.e621_eris_candidates(b"frame", "user", "key")
+            second = plugin.e621_eris_candidates(b"frame", "user", "key")
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertTrue(plugin._ERIS_DISABLED_FOR_RUN)
+        self.assertEqual(logger.call_count, 1)
+
+    def test_saucenao_e621_hit_skips_eris_for_that_frame(self):
+        settings = {
+            "saucenao_api_key": "sauce",
+            "e621_username": "user",
+            "e621_api_key": "key",
+        }
+        with mock.patch.object(plugin, "DISCOVERY_RATIOS", (0.5,)), \
+             mock.patch.object(plugin, "extract_jpeg_frame", return_value=b"frame"), \
+             mock.patch.object(
+                 plugin,
+                 "saucenao_candidates",
+                 return_value=[(95.0, "e621", "123")],
+             ), \
+             mock.patch.object(plugin, "e621_eris_candidates") as eris:
+            rows, had_error = plugin.discover_candidates(
+                "local.mp4", 100.0, "ffmpeg", settings
+            )
+
+        self.assertFalse(had_error)
+        self.assertEqual(rows[0][:3], ("e621", "123", 1))
+        eris.assert_not_called()
+
     def test_e621_video_media_filter(self):
         post = {"file": {"ext": "webm", "url": "https://static.example/video.webm"}}
         self.assertEqual(
