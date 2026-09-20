@@ -1,5 +1,16 @@
 # Booru Video Importer
 
+## Install through Stash
+
+Add this source in **Stash → Settings → Plugins** after GitHub Pages deployment is enabled for this repository:
+
+```text
+https://purpsll.github.io/Booru-Video-Importer/main/index.yml
+```
+
+Refresh plugin sources and install **Booru Video Importer**.
+
+
 A separate Stash plugin for reverse-searching **video scenes** against **e621** and **Rule34** metadata.
 
 It does not process Stash Images and it does not share the image Booru Importer's queues or status tags.
