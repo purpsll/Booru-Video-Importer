@@ -129,5 +129,140 @@ class VideoMatchTests(unittest.TestCase):
         self.assertIn("https://source.example/post", metadata["urls"])
 
 
+    def test_early_hash_candidate_requires_strong_agreement(self):
+        result = video_match.early_hash_candidate(
+            [0x0000000000000000, 0x000000000000000F],
+            [0x0000000000000001, 0x000000000000000E],
+            max_distance=4,
+        )
+        self.assertTrue(result["candidate"])
+        self.assertEqual(result["matched"], 2)
+
+    def test_current_e621_files_schema_is_supported(self):
+        post = {
+            "id": 321,
+            "files": {
+                "meta": {"ext": "webm", "md5": "abc", "duration": 12.5},
+                "original": {"url": "https://static.example/321.webm"},
+                "preview": {"jpg": "https://static.example/321-preview.jpg"},
+            },
+        }
+        info = plugin.e621_file_info(post)
+        self.assertEqual(info["ext"], "webm")
+        self.assertEqual(info["md5"], "abc")
+        self.assertEqual(info["duration"], 12.5)
+        self.assertEqual(
+            plugin.media_url("e621", post),
+            "https://static.example/321.webm",
+        )
+
+    def test_e621_source_page_merges_webm_and_mp4(self):
+        webm = [{
+            "id": 20,
+            "files": {
+                "meta": {"ext": "webm", "md5": "a"},
+                "original": {"url": "https://static.example/20.webm"},
+            },
+        }]
+        mp4 = [{
+            "id": 21,
+            "files": {
+                "meta": {"ext": "mp4", "md5": "b"},
+                "original": {"url": "https://static.example/21.mp4"},
+            },
+        }]
+        with mock.patch.object(
+            plugin, "e621_request", side_effect=[webm, mp4]
+        ) as request:
+            rows = plugin.e621_video_posts_page("user", "key", before_id=99, limit=10)
+
+        self.assertEqual([row["id"] for row in rows], [21, 20])
+        self.assertEqual(request.call_count, 2)
+        for call in request.call_args_list:
+            self.assertIn("v2=true", call.args[0])
+            self.assertIn("mode=extended", call.args[0])
+            self.assertIn("page=b99", call.args[0])
+
+    def test_organized_toggle_skips_scene_before_matching(self):
+        scene = {
+            "id": "44",
+            "organized": True,
+            "tags": [],
+            "files": [{
+                "id": "f44",
+                "path": "/video.mp4",
+                "duration": 10.0,
+                "fingerprints": [{"type": "md5", "value": "abc"}],
+            }],
+        }
+        stash = mock.Mock()
+        settings = {"skip_organized_scenes": True}
+        with mock.patch.object(plugin, "exact_candidates") as exact:
+            result = plugin.process_scene(
+                stash,
+                scene,
+                settings,
+                deep=False,
+                dry_run=False,
+                tag_cache={},
+                performer_cache={},
+                studio_cache={},
+            )
+
+        self.assertEqual(result, "skipped_organized")
+        exact.assert_not_called()
+        stash.update_scene.assert_not_called()
+
+    def test_apply_metadata_respects_organized_protection(self):
+        scene = {
+            "id": "45",
+            "organized": True,
+            "tags": [],
+            "performers": [],
+            "urls": [],
+            "studio": None,
+            "date": None,
+        }
+        stash = mock.Mock()
+        plugin.apply_metadata(
+            stash,
+            scene,
+            "e621",
+            {
+                "id": 1,
+                "tags": {"general": ["new_tag"]},
+                "sources": [],
+                "created_at": "2026-09-01T00:00:00Z",
+            },
+            {"skip_organized_scenes": True},
+            {},
+            {},
+            {},
+            False,
+        )
+        stash.update_scene.assert_not_called()
+
+    def test_source_first_local_candidates_prefers_matching_early_hashes(self):
+        local_index = [
+            {
+                "scene_id": "1",
+                "duration": 10.0,
+                "hashes": [0x0000, 0x000F],
+            },
+            {
+                "scene_id": "2",
+                "duration": 10.0,
+                "hashes": [0xFFFF, 0xFFF0],
+            },
+        ]
+        rows = plugin.source_first_local_candidates(
+            local_index,
+            [0x0001, 0x000E],
+            10.0,
+        )
+        self.assertTrue(rows)
+        self.assertEqual(rows[0][1]["scene_id"], "1")
+
+
 if __name__ == "__main__":
     unittest.main()
