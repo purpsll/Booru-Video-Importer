@@ -28,7 +28,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from stash_client import Stash, fingerprint, primary_video
-from source_index import load_cache, save_cache, scene_signature
+from source_index import (
+    load_cache,
+    load_scan_state,
+    save_cache,
+    save_scan_state,
+    scene_signature,
+)
 from video_match import (
     DEFAULT_RATIOS,
     early_frame_hashes,
@@ -39,7 +45,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -1151,26 +1157,93 @@ def _duration_delta(local_duration: float, remote_duration: float) -> float:
     return abs(local_duration - remote_duration) / max(local_duration, remote_duration)
 
 
-def source_first_duration_candidates(
-    local_index: Sequence[Dict[str, Any]],
-    remote_duration: float,
-    tolerance_seconds: float,
-) -> List[Dict[str, Any]]:
-    """Filter local scenes by e621-reported duration before any remote frame work."""
-    remote_duration = max(0.0, float(remote_duration))
-    tolerance_seconds = max(0.0, float(tolerance_seconds))
-    if remote_duration <= 0:
-        return []
+def duration_milliseconds(value: Any) -> int:
+    """Normalize a video duration to the nearest millisecond."""
+    seconds = as_float(value, 0.0)
+    if seconds <= 0:
+        return 0
+    return int(round(seconds * 1000.0))
 
-    rows: List[Dict[str, Any]] = []
+
+def build_duration_buckets(
+    local_index: Sequence[Dict[str, Any]],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Group local Stash videos by exact normalized millisecond duration."""
+    buckets: Dict[int, List[Dict[str, Any]]] = {}
     for entry in local_index:
-        local_duration = as_float(entry.get("duration"), 0.0)
-        if local_duration <= 0:
+        key = duration_milliseconds(entry.get("duration"))
+        if key <= 0:
             continue
-        difference = abs(local_duration - remote_duration)
-        if difference <= tolerance_seconds:
-            rows.append(entry)
-    return rows
+        buckets.setdefault(key, []).append(entry)
+    return buckets
+
+
+def source_first_duration_candidates(
+    duration_buckets: Dict[int, List[Dict[str, Any]]],
+    remote_duration: float,
+) -> List[Dict[str, Any]]:
+    """Return only local scenes with the exact same normalized duration."""
+    key = duration_milliseconds(remote_duration)
+    if key <= 0:
+        return []
+    return list(duration_buckets.get(key) or [])
+
+
+def _source_cursor_scope(
+    stash: Stash,
+    settings: Dict[str, Any],
+) -> Tuple[str, str]:
+    scope_name = configured_stash_tag_scope(settings)
+    if not scope_name:
+        return "__all__", "all eligible Stash videos"
+    tag_id, canonical = resolve_stash_tag_filter(stash, scope_name)
+    if not tag_id:
+        raise RuntimeError(f"Stash tag scope not found: {scope_name}")
+    return f"tag:{tag_id}", canonical or scope_name
+
+
+def _load_source_cursor(scope_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    state = load_scan_state()
+    scopes = state.setdefault("scopes", {})
+    if not isinstance(scopes, dict):
+        scopes = {}
+        state["scopes"] = scopes
+    scope_state = scopes.get(scope_key)
+    if not isinstance(scope_state, dict):
+        scope_state = {}
+        scopes[scope_key] = scope_state
+    return state, scope_state
+
+
+def _save_source_cursor(
+    state: Dict[str, Any],
+    scope_key: str,
+    *,
+    before_id: Optional[int],
+    exhausted: bool,
+) -> None:
+    scopes = state.setdefault("scopes", {})
+    scopes[scope_key] = {
+        "before_id": int(before_id) if before_id else None,
+        "exhausted": bool(exhausted),
+        "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    }
+    save_scan_state(state)
+
+
+def reset_source_cursor(
+    stash: Stash,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    scope_key, scope_label = _source_cursor_scope(stash, settings)
+    state = load_scan_state()
+    scopes = state.setdefault("scopes", {})
+    existed = scope_key in scopes
+    scopes.pop(scope_key, None)
+    save_scan_state(state)
+    log("INFO", f"Reset e621 source-first cursor for {scope_label}")
+    return {"cursor_reset": 1 if existed else 0, "scope": scope_label}
+
 
 
 def source_first_local_candidates(
@@ -1182,7 +1255,11 @@ def source_first_local_candidates(
         Tuple[Tuple[float, float, float], Dict[str, Any], Dict[str, object]]
     ] = []
 
+    remote_duration_ms = duration_milliseconds(remote_duration)
     for entry in local_index:
+        if duration_milliseconds(entry.get("duration")) != remote_duration_ms:
+            continue
+
         early = early_hash_candidate(
             entry.get("hashes") or [],
             remote_hashes,
@@ -1195,12 +1272,6 @@ def source_first_local_candidates(
             as_float(entry.get("duration"), 0.0),
             remote_duration,
         )
-        # Source-first matching is deliberately strict: the e621 file and local
-        # Stash scene must be close in duration before an early visual hit can
-        # become a full-video candidate. This prevents generic-looking clips from
-        # reaching verification on frame similarity alone.
-        if duration_delta > 0.03:
-            continue
 
         rank = (
             float(early.get("matched") or 0),
@@ -1223,13 +1294,6 @@ def source_first_e621(
     force_index = as_bool(args.get("force_index"), False)
     post_limit = max(0, as_int(args.get("source_post_limit"), 0))
     configured_pages = as_int(settings.get("e621_source_pages"), 5)
-    duration_tolerance = max(
-        0.0,
-        as_float(settings.get("source_first_duration_tolerance_seconds"), 1.0),
-    )
-    stash_tag_filter = " ".join(
-        str(settings.get("stash_source_tag_filter") or "").split()
-    )
     source_pages = max(
         1,
         min(100, as_int(args.get("source_pages"), configured_pages or 5)),
@@ -1243,6 +1307,11 @@ def source_first_e621(
         settings,
         force=force_index,
     )
+    duration_buckets = build_duration_buckets(local_index)
+    scope_key, scope_label = _source_cursor_scope(stash, settings)
+    scan_state, cursor_state = _load_source_cursor(scope_key)
+    cursor_before_id = as_int(cursor_state.get("before_id"), 0) or None
+    cursor_exhausted = as_bool(cursor_state.get("exhausted"), False)
 
     tag_cache = stash.all_tags()
     performer_cache = stash.all_performers()
@@ -1253,6 +1322,7 @@ def source_first_e621(
         "video_posts": 0,
         "duration_candidates": 0,
         "duration_filtered_posts": 0,
+        "duration_unknown_posts": 0,
         "early_candidates": 0,
         "verified_matches": 0,
         "high_confidence_review": 0,
@@ -1260,13 +1330,37 @@ def source_first_e621(
         "provider_errors": 0,
         "local_index_size": len(local_index),
         "organized_protected": int(index_stats.get("skipped_organized") or 0),
+        "cursor_start_before_id": cursor_before_id or 0,
+        "cursor_end_before_id": cursor_before_id or 0,
+        "cursor_exhausted": 1 if cursor_exhausted else 0,
     }
     if not local_index:
         log("INFO", "e621 source-first scan stopped: no eligible local scenes in index")
         return stats
+    if cursor_exhausted and not dry_run:
+        log(
+            "INFO",
+            f"e621 source-first history is already exhausted for {scope_label}; "
+            "run Reset e621 Source-First Cursor to start over",
+        )
+        return stats
 
-    before_id: Optional[int] = None
+    if dry_run:
+        log(
+            "INFO",
+            f"Previewing e621 source-first from cursor {cursor_before_id or 'newest'} "
+            f"for {scope_label}; cursor will not advance",
+        )
+    else:
+        log(
+            "INFO",
+            f"Continuing e621 source-first from {cursor_before_id or 'newest'} "
+            f"for {scope_label}",
+        )
+
+    before_id: Optional[int] = cursor_before_id
     stop = False
+    exhausted = False
     for page_number in range(source_pages):
         try:
             posts = e621_video_posts_page(
@@ -1281,17 +1375,22 @@ def source_first_e621(
             break
 
         if not posts:
+            exhausted = True
             break
 
         ids = [as_int(post.get("id"), 0) for post in posts if as_int(post.get("id"), 0) > 0]
         if ids:
             before_id = min(ids)
 
+        last_processed_id: Optional[int] = None
         for post in posts:
             if post_limit and stats["posts_seen"] >= post_limit:
                 stop = True
                 break
 
+            post_id_int = as_int(post.get("id"), 0)
+            if post_id_int > 0:
+                last_processed_id = post_id_int
             stats["posts_seen"] += 1
             remote_url = media_url("e621", post)
             if not remote_url:
@@ -1300,29 +1399,28 @@ def source_first_e621(
 
             info = e621_file_info(post)
             remote_duration = as_float(info.get("duration"), 0.0)
-            try:
-                if remote_duration <= 0:
-                    remote_duration = probe_duration(remote_url, ffmpeg_path, 45)
-            except Exception as exc:
-                stats["provider_errors"] += 1
+            remote_duration_ms = duration_milliseconds(remote_duration)
+            if remote_duration_ms <= 0:
+                stats["duration_unknown_posts"] += 1
                 log(
-                    "WARNING",
-                    f"e621 post {post.get('id')}: duration lookup failed: {exc}",
+                    "INFO",
+                    f"e621 #{post.get('id')}: no duration metadata; "
+                    "skipping without opening the video",
                 )
+                if post_limit:
+                    progress(stats["posts_seen"] / max(1, post_limit))
                 continue
 
             duration_pool = source_first_duration_candidates(
-                local_index,
+                duration_buckets,
                 remote_duration,
-                duration_tolerance,
             )
             if not duration_pool:
                 stats["duration_filtered_posts"] += 1
                 log(
                     "INFO",
-                    f"e621 #{post.get('id')}: no local scenes within "
-                    f"{duration_tolerance:.2f}s of {remote_duration:.2f}s; "
-                    "skipping frame comparison",
+                    f"e621 #{post.get('id')}: duration {remote_duration_ms} ms "
+                    "has no exact local Stash duration match; skipping before frame scan",
                 )
                 if post_limit:
                     progress(stats["posts_seen"] / max(1, post_limit))
@@ -1509,12 +1607,33 @@ def source_first_e621(
             if post_limit:
                 progress(stats["posts_seen"] / max(1, post_limit))
 
+        if not dry_run and last_processed_id:
+            before_id = last_processed_id
+            _save_source_cursor(
+                scan_state,
+                scope_key,
+                before_id=before_id,
+                exhausted=False,
+            )
+            stats["cursor_end_before_id"] = before_id
+
         if stop:
             break
         if not ids:
+            exhausted = True
             break
         if not post_limit:
             progress((page_number + 1) / source_pages)
+
+    if exhausted and not dry_run:
+        _save_source_cursor(
+            scan_state,
+            scope_key,
+            before_id=before_id,
+            exhausted=True,
+        )
+        stats["cursor_exhausted"] = 1
+        log("INFO", f"e621 source-first history exhausted for {scope_label}")
 
     return stats
 
@@ -1815,6 +1934,8 @@ def main() -> None:
         stats = build_source_index_task(stash, settings, args)
     elif mode == "source_first_e621":
         stats = source_first_e621(stash, settings, args)
+    elif mode == "reset_source_cursor":
+        stats = reset_source_cursor(stash, settings)
     else:
         raise RuntimeError(f"Unsupported mode: {mode}")
     log("INFO", f"Finished Booru Video Importer: {stats}")

@@ -54,7 +54,15 @@ For e621 source-first matching:
 
 The local frame index is cached and unchanged files reuse their hashes on later runs.
 
-Source-first matching is intentionally strict: both early frames must match at the same positions, duration is filtered to within 1 second by default, and final verification compares stronger 256-bit perceptual hashes at seven aligned timestamps. A high-confidence result requires all seven sampled frames to pass plus nearly identical runtime. **Allow Source-First Auto Import** is off by default, so verified source-first results go to Review until you explicitly enable automatic metadata writes.
+### Historical e621 scanning
+
+Full source-first runs remember their position in e621 history and continue backward on the next run rather than restarting at the newest posts. The cursor is stored separately for each **Stash Tag Scope**, so a `furry` scan progresses independently from another tag scope.
+
+**Preview e621 Source-First Match** reads from the current cursor but never advances it. **Reset e621 Source-First Cursor** resets only the currently selected Stash Tag Scope back to newest. Reset the cursor after adding new local videos if you want already-scanned historical e621 posts reconsidered.
+
+Source-first matching is intentionally strict. Before an e621 video is opened, its API-reported duration is normalized to milliseconds and must exactly equal the normalized duration of at least one eligible local Stash video. A 60.000-second local video will not cause 59.999-second or 60.001-second e621 videos to be frame-scanned. Posts with missing duration metadata are skipped without opening the remote video.
+
+Only exact-duration candidates continue to two aligned early-frame checks and seven aligned 256-bit perceptual verification points. A high-confidence result requires all seven sampled frames to pass. **Allow Source-First Auto Import** remains off by default, so verified source-first results go to Review until explicitly enabled.
 
 The plugin uses its own status tags and does not share queues with the image Booru Importer.
 

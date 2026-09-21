@@ -313,29 +313,27 @@ class VideoMatchTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
-    def test_duration_prefilter_only_keeps_same_length_scenes(self):
+    def test_duration_prefilter_only_keeps_exact_millisecond_bucket(self):
         local_index = [
-            {"scene_id": "1", "duration": 100.0, "hashes": [1, 2]},
-            {"scene_id": "2", "duration": 102.1, "hashes": [1, 2]},
-            {"scene_id": "3", "duration": 101.9, "hashes": [1, 2]},
+            {"scene_id": "1", "duration": 60.000, "hashes": [1, 2]},
+            {"scene_id": "2", "duration": 60.001, "hashes": [1, 2]},
+            {"scene_id": "3", "duration": 59.999, "hashes": [1, 2]},
         ]
-        rows = plugin.source_first_duration_candidates(
-            local_index,
-            100.0,
-            2.0,
-        )
-        self.assertEqual(
-            [row["scene_id"] for row in rows],
-            ["1", "3"],
-        )
+        buckets = plugin.build_duration_buckets(local_index)
+        rows = plugin.source_first_duration_candidates(buckets, 60.000)
+        self.assertEqual([row["scene_id"] for row in rows], ["1"])
 
     def test_duration_prefilter_rejects_unknown_remote_duration(self):
-        rows = plugin.source_first_duration_candidates(
-            [{"scene_id": "1", "duration": 100.0, "hashes": [1, 2]}],
-            0.0,
-            2.0,
+        buckets = plugin.build_duration_buckets(
+            [{"scene_id": "1", "duration": 100.0, "hashes": [1, 2]}]
         )
+        rows = plugin.source_first_duration_candidates(buckets, 0.0)
         self.assertEqual(rows, [])
+
+    def test_duration_millisecond_normalization(self):
+        self.assertEqual(plugin.duration_milliseconds(60.0), 60000)
+        self.assertEqual(plugin.duration_milliseconds(60.001), 60001)
+        self.assertEqual(plugin.duration_milliseconds(59.999), 59999)
 
 
     def test_dynamic_stash_tag_scope_accepts_any_name_or_alias(self):
@@ -398,6 +396,60 @@ class VideoMatchTests(unittest.TestCase):
         )
         self.assertTrue(result["high"])
         self.assertEqual(result["matched_frames"], 7)
+
+
+    def test_source_first_candidate_rejects_nonexact_duration_even_with_same_hashes(self):
+        rows = plugin.source_first_local_candidates(
+            [{"scene_id": "1", "duration": 60.001, "hashes": [0, 15]}],
+            [0, 15],
+            60.000,
+        )
+        self.assertEqual(rows, [])
+
+    def test_source_cursor_is_scoped_by_stash_tag(self):
+        stash = mock.Mock()
+        settings = {"stash_tag_scope": "furry"}
+        with mock.patch.object(
+            plugin,
+            "resolve_stash_tag_filter",
+            return_value=("77", "Furry"),
+        ):
+            key, label = plugin._source_cursor_scope(stash, settings)
+        self.assertEqual(key, "tag:77")
+        self.assertEqual(label, "Furry")
+
+        key, label = plugin._source_cursor_scope(stash, {})
+        self.assertEqual(key, "__all__")
+        self.assertIn("all eligible", label)
+
+    def test_reset_source_cursor_removes_only_current_scope(self):
+        stash = mock.Mock()
+        settings = {"stash_tag_scope": "furry"}
+        state = {
+            "version": 1,
+            "scopes": {
+                "tag:77": {"before_id": 123, "exhausted": False},
+                "tag:88": {"before_id": 456, "exhausted": False},
+            },
+        }
+        with mock.patch.object(
+            plugin,
+            "resolve_stash_tag_filter",
+            return_value=("77", "Furry"),
+        ), mock.patch.object(
+            plugin,
+            "load_scan_state",
+            return_value=state,
+        ), mock.patch.object(
+            plugin,
+            "save_scan_state",
+        ) as save:
+            result = plugin.reset_source_cursor(stash, settings)
+
+        self.assertEqual(result["cursor_reset"], 1)
+        self.assertNotIn("tag:77", state["scopes"])
+        self.assertIn("tag:88", state["scopes"])
+        save.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 CACHE_VERSION = 2
 DEFAULT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "booru_video_hash_index.json")
+DEFAULT_SCAN_STATE_PATH = os.path.join(os.path.dirname(__file__), "booru_video_scan_state.json")
 
 
 def load_cache(path: str = DEFAULT_CACHE_PATH) -> Dict[str, Any]:
@@ -32,6 +33,43 @@ def save_cache(data: Dict[str, Any], path: str = DEFAULT_CACHE_PATH) -> None:
     payload.setdefault("scenes", {})
 
     fd, temp_path = tempfile.mkstemp(prefix=".booru-video-index-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def load_scan_state(path: str = DEFAULT_SCAN_STATE_PATH) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {"version": 1, "scopes": {}}
+        scopes = data.get("scopes")
+        if not isinstance(scopes, dict):
+            data["scopes"] = {}
+        data.setdefault("version", 1)
+        return data
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "scopes": {}}
+
+
+def save_scan_state(data: Dict[str, Any], path: str = DEFAULT_SCAN_STATE_PATH) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    payload = dict(data)
+    payload["version"] = 1
+    payload.setdefault("scopes", {})
+
+    fd, temp_path = tempfile.mkstemp(prefix=".booru-video-scan-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, sort_keys=True, separators=(",", ":"))

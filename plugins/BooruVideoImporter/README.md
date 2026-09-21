@@ -80,8 +80,11 @@ Creates or refreshes the cached early-frame hashes used by source-first matching
 **7. Preview e621 Source-First Match (25 Posts, No Changes)**  
 Tests recent e621 WebM/MP4 posts against the local frame index without changing Stash.
 
-**8. Match e621 Videos to Local Stash**  
-Scans e621 video posts against only the currently selected Stash Tag Scope (or all eligible videos when blank). Duration is filtered first, then two aligned early frames must agree, followed by ultra-strict seven-point aligned verification.
+**8. Continue e621 History Match to Local Stash**  
+Continues backward from the saved e621 cursor for the current Stash Tag Scope. An e621 video's API duration must exactly match a local video's normalized millisecond duration before the remote video is opened. Only then are early frames and seven aligned verification frames examined.
+
+**9. Reset e621 Source-First Cursor**  
+Resets the current Stash Tag Scope to the newest e621 videos. Use this after adding local videos when you want previously scanned history reconsidered.
 
 ## Dynamic Stash Tag Scope
 
@@ -96,6 +99,14 @@ The scope applies across Fast Scan, Deep Scan, Review/Retry processing, local fr
 ### Protect Organized Scenes
 
 Enable **Protect Organized Scenes** to make Stash scenes marked Organized completely read-only to this plugin. Protected scenes receive no tags, performers, studio, URLs, dates, or workflow markers.
+
+### Exact duration matching
+
+Source-first matching has no duration tolerance. Durations are normalized to integer milliseconds and must match exactly before any e621 video frame is read. Missing e621 duration metadata is skipped rather than probed remotely.
+
+### Historical cursor
+
+Each Stash Tag Scope has its own persistent e621 history cursor. Full runs continue older; previews never advance the cursor.
 
 ### e621
 
