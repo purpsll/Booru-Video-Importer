@@ -749,7 +749,8 @@ def build_update_catalog(
                 row = _catalog_row_from_post(post)
                 if row:
                     rows.append(row)
-            stats["metadata_rows_upserted"] += catalog.upsert_videos(rows)
+            upserted = catalog.upsert_videos(rows)
+            stats["metadata_rows_upserted"] += as_int(upserted, 0)
 
             last_id = max(
                 (as_int(post.get("id"), 0) for post in posts),
