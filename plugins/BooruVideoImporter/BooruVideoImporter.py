@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from stash_client import Stash, primary_video
@@ -44,7 +44,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 E621_BASE = "https://e621.net"
 E621_PAGE_SIZE = 75
@@ -597,10 +597,10 @@ def _save_scope_state(
             {str(value) for value in completed_scene_ids}
         ),
         "updated_at": (
-            datetime.utcnow()
+            datetime.now(timezone.utc)
             .replace(microsecond=0)
             .isoformat()
-            + "Z"
+            .replace("+00:00", "Z")
         ),
     }
     save_scan_state(state)
@@ -651,16 +651,14 @@ def match_stash_against_e621(
     dry_run = as_bool(args.get("dry_run"), False)
     username = str(settings.get("e621_username") or "")
     api_key = str(settings.get("e621_api_key") or "")
-    pages_per_run = max(
-        1,
-        min(
-            100,
-            as_int(
-                args.get("pages_per_run"),
-                as_int(settings.get("e621_pages_per_run"), 10) or 10,
-            ),
-        ),
+    configured_pages = as_int(
+        args.get("pages_per_run"),
+        as_int(settings.get("e621_pages_per_run"), 0),
     )
+    # 0 or blank means continuous scanning for the active local video until a
+    # verified match is found or both e621 WebM and MP4 histories are exhausted.
+    continuous_scan = configured_pages <= 0
+    pages_per_run = 0 if continuous_scan else max(1, configured_pages)
     local_limit = max(0, as_int(args.get("local_limit"), 0))
 
     scenes, local_stats = eligible_local_scenes(stash, settings)
@@ -742,7 +740,11 @@ def match_stash_against_e621(
         exhausted_scene = False
         pages_used = 0
 
-        while pages_used < pages_per_run and not matched and not exhausted_scene:
+        while (
+            (continuous_scan or pages_used < pages_per_run)
+            and not matched
+            and not exhausted_scene
+        ):
             try:
                 posts = e621_video_posts_page(
                     current_ext,
@@ -985,8 +987,9 @@ def match_stash_against_e621(
             active_before_id = None
             continue
 
-        # Page budget or provider failure: stay on this file. The saved state
-        # points to the next older page for a safe continuation.
+        # If we are here, the scene did not match and did not exhaust history.
+        # Either a finite page budget was reached or a provider/runtime issue
+        # interrupted a continuous scan. Persist a safe resume cursor.
         _save_scope_state(
             state,
             scope_key,
@@ -995,12 +998,20 @@ def match_stash_against_e621(
             before_id=before_id,
             completed_scene_ids=completed_scene_ids,
         )
-        log(
-            "INFO",
-            f"Scene {scene_id}: run stopped before history was exhausted; "
-            f"next run resumes this same file in {current_ext} at "
-            f"{before_id or 'newest'}",
-        )
+        if continuous_scan:
+            log(
+                "INFO",
+                f"Scene {scene_id}: continuous scan stopped before history "
+                f"was exhausted; next run resumes this same file in "
+                f"{current_ext} at {before_id or 'newest'}",
+            )
+        else:
+            log(
+                "INFO",
+                f"Scene {scene_id}: configured page budget reached; next run "
+                f"resumes this same file in {current_ext} at "
+                f"{before_id or 'newest'}",
+            )
         break
 
     return stats

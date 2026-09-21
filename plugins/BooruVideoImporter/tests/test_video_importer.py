@@ -469,5 +469,144 @@ class BooruVideoImporterTests(unittest.TestCase):
         self.assertEqual(metadata["date"], "2026-09-01")
 
 
+    def test_zero_pages_runs_continuously_until_both_histories_exhaust(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+        scene = {
+            "id": "10",
+            "organized": False,
+            "urls": [],
+            "tags": [],
+            "performers": [],
+            "studio": None,
+            "date": None,
+            "files": [{"path": "/local.mp4", "duration": 60.0}],
+        }
+        page_one = [{
+            "id": 300,
+            "file": {
+                "ext": "webm",
+                "url": "https://example/300.webm",
+                "duration": 59.0,
+            },
+        }]
+        page_two = [{
+            "id": 200,
+            "file": {
+                "ext": "webm",
+                "url": "https://example/200.webm",
+                "duration": 61.0,
+            },
+        }]
+        calls = []
+
+        def pages(ext, _user, _key, before_id=None, limit=75):
+            calls.append((ext, before_id))
+            if len(calls) == 1:
+                return page_one
+            if len(calls) == 2:
+                return page_two
+            return []
+
+        with mock.patch.object(
+            plugin, "eligible_local_scenes",
+            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
+        ), mock.patch.object(
+            plugin, "_scope", return_value=(None, "__all__", "all"),
+        ), mock.patch.object(
+            plugin, "_load_scope_state",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
+        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
+            plugin, "_save_scope_state",
+        ), mock.patch.object(
+            plugin, "_prepare_local_entry",
+            return_value={
+                "scene": scene,
+                "scene_id": "10",
+                "path": "/local.mp4",
+                "duration": 60.0,
+                "duration_ms": 60000,
+                "early_hashes": [1, 2],
+            },
+        ), mock.patch.object(
+            plugin, "e621_video_posts_page", side_effect=pages
+        ):
+            stats = plugin.match_stash_against_e621(
+                stash,
+                {"e621_pages_per_run": 0},
+                {"dry_run": False, "pages_per_run": 0},
+            )
+
+        self.assertEqual(
+            calls,
+            [("webm", None), ("webm", 300), ("webm", 200), ("mp4", None)],
+        )
+        self.assertEqual(stats["local_videos_exhausted"], 1)
+        self.assertEqual(stats["e621_posts_seen"], 2)
+
+    def test_positive_page_limit_still_stops_and_saves_progress(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+        scene = {
+            "id": "10",
+            "organized": False,
+            "urls": [],
+            "tags": [],
+            "performers": [],
+            "studio": None,
+            "date": None,
+            "files": [{"path": "/local.mp4", "duration": 60.0}],
+        }
+        page = [{
+            "id": 300,
+            "file": {
+                "ext": "webm",
+                "url": "https://example/300.webm",
+                "duration": 59.0,
+            },
+        }]
+        with mock.patch.object(
+            plugin, "eligible_local_scenes",
+            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
+        ), mock.patch.object(
+            plugin, "_scope", return_value=(None, "__all__", "all"),
+        ), mock.patch.object(
+            plugin, "_load_scope_state",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
+        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
+            plugin, "_prepare_local_entry",
+            return_value={
+                "scene": scene,
+                "scene_id": "10",
+                "path": "/local.mp4",
+                "duration": 60.0,
+                "duration_ms": 60000,
+                "early_hashes": [1, 2],
+            },
+        ), mock.patch.object(
+            plugin, "e621_video_posts_page", return_value=page
+        ) as pages, mock.patch.object(
+            plugin, "_save_scope_state",
+        ) as save:
+            plugin.match_stash_against_e621(
+                stash,
+                {"e621_pages_per_run": 1},
+                {"dry_run": False, "pages_per_run": 1},
+            )
+
+        self.assertEqual(pages.call_count, 1)
+        self.assertEqual(save.call_args.kwargs["before_id"], 300)
+
+
 if __name__ == "__main__":
     unittest.main()

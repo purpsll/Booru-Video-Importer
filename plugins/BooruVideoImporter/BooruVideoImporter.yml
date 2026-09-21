@@ -1,6 +1,6 @@
 name: Booru Video Importer
 description: Stash-first exhaustive e621 video matcher. Processes one filtered local video at a time, rejects non-exact-duration e621 videos before opening media, verifies same-timecode frames, and imports authoritative e621 metadata on the first verified match.
-version: 2.0.0
+version: 2.0.1
 
 exec:
   - python
@@ -22,7 +22,7 @@ settings:
 
   e621_pages_per_run:
     displayName: e621 History Pages per Stash Video per Run
-    description: Number of e621 video-history pages to scan for the current local video before saving progress. The next run resumes the same local file. Leave blank or 0 to use 10 pages.
+    description: Set to 0 or leave blank for continuous scanning. Continuous mode keeps scanning the active local Stash video until it finds a verified match or exhausts all e621 WebM + MP4 history, then automatically moves to the next local video. Set a positive number only if you want each run capped to that many e621 pages.
     type: NUMBER
 
   e621_username:
@@ -49,6 +49,7 @@ tasks:
     defaultArgs:
       mode: match
       dry_run: false
+      pages_per_run: 0
 
   - name: Reset Matching Progress
     description: Clears saved progress for the current Stash Tag Scope. The next run starts the first eligible local video from the newest e621 WebM history again.
