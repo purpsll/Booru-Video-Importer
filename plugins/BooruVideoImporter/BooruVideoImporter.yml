@@ -1,6 +1,6 @@
 name: Booru Video Importer
 description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and e621 source-first matching that compares early video frames against a cached local Stash frame index before full multi-frame verification.
-version: 1.1.2
+version: 1.1.3
 
 exec:
   - python
@@ -10,6 +10,11 @@ interface: raw
 errLog: info
 
 settings:
+  stash_tag_scope:
+    displayName: Stash Tag Scope (any tag or alias)
+    description: Optional. Enter any existing Stash tag name or alias, for example furry. The plugin resolves it live against your Stash tags and processes only video scenes carrying that tag. Leave blank to process all eligible videos.
+    type: STRING
+
   skip_organized_scenes:
     displayName: Protect Organized Scenes
     description: When enabled, any Stash scene already marked Organized is skipped completely. The plugin will not add tags, performers, studio, URLs, dates, or workflow markers to that scene.
@@ -17,7 +22,7 @@ settings:
 
   source_first_duration_tolerance_seconds:
     displayName: Source-First Duration Tolerance (seconds)
-    description: e621 videos are compared only to local Stash scenes within this many seconds of the same duration before any frame hashing is attempted. Default 2.0 seconds.
+    description: e621 videos are compared only to local Stash scenes within this many seconds of the same duration before any frame hashing is attempted. Default 1.0 second.
     type: NUMBER
 
   source_first_auto_import:
@@ -62,7 +67,7 @@ settings:
 
 tasks:
   - name: 1. Scan Unprocessed Videos (Fast)
-    description: Start here. Checks unclassified Stash scenes for exact video-file MD5 matches on e621 and Rule34. Exact video matches import metadata immediately; misses are queued as Booru Video Unresolved.
+    description: Start here. Checks unclassified Stash scenes for exact video-file MD5 matches on e621 and Rule34. If Stash Tag Scope is set, only scenes carrying that tag are scanned. Exact video matches import metadata immediately; misses are queued as Booru Video Unresolved.
     defaultArgs:
       mode: import_all
       lookup_mode: fast
@@ -100,7 +105,7 @@ tasks:
       only_no_match: true
 
   - name: 6. Build / Refresh Local Video Frame Index
-    description: Builds a cached early-frame hash index for eligible Stash scenes. Unchanged files reuse cached hashes on later runs. Organized scenes are excluded when Protect Organized Scenes is enabled.
+    description: Builds a cached early-frame hash index for eligible Stash scenes. If Stash Tag Scope is set, only scenes carrying that live Stash tag or alias are indexed. Unchanged files reuse cached hashes on later runs.
     defaultArgs:
       mode: build_source_index
       force_index: false
@@ -114,7 +119,7 @@ tasks:
       source_post_limit: 25
 
   - name: 8. Match e621 Videos to Local Stash
-    description: Scans recent e621 WebM/MP4 posts outward. Duration is checked first; only local scenes within the configured duration tolerance are frame-compared. Candidates still require two aligned early-frame matches and strict full-video verification. High-confidence results go to Review unless Allow Source-First Auto Import is enabled.
+    description: Scans recent e621 WebM/MP4 posts outward against the selected Stash Tag Scope. Duration is checked first; only local scenes within 1 second by default are frame-compared. Candidates require two aligned early-frame matches and ultra-strict full-video verification. High-confidence results go to Review unless Allow Source-First Auto Import is enabled.
     defaultArgs:
       mode: source_first_e621
       dry_run: false
