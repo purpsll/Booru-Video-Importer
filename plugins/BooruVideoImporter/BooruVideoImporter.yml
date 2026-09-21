@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Stash-first exhaustive e621 video matcher. Processes one filtered local video at a time, rejects non-exact-duration e621 videos before opening media, verifies same-timecode frames, and imports authoritative e621 metadata on the first verified match.
-version: 2.0.1
+description: Stash-first e621 video matcher. Checks the exact primary-video MD5 first for an immediate byte-identical match, then falls back to exhaustive exact-duration and same-timecode frame verification when the file has been remuxed or re-encoded.
+version: 2.1.0
 
 exec:
   - python
@@ -45,7 +45,7 @@ tasks:
       local_limit: 1
 
   - name: Match Filtered Stash Videos Against e621
-    description: Main importer. Keeps one local Stash video active while walking all e621 WebM then MP4 history. Non-exact-duration posts are skipped before opening media. Exact-duration candidates are tested sequentially at the same timecodes until one verifies; metadata is imported on the first match. If e621 history is exhausted with no match, the next local video begins from newest.
+    description: Main importer. Checks the primary Stash video file's MD5 directly against e621 first; byte-identical files import immediately with no history scan. MD5 misses fall back to the continuous WebM/MP4 history search using exact duration before remote media access and strict same-timecode verification.
     defaultArgs:
       mode: match
       dry_run: false
