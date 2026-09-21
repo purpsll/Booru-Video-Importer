@@ -5,11 +5,12 @@ import unittest
 from unittest import mock
 import sys
 
-import video_match
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parents[1]
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
+
+import video_match
 
 spec = importlib.util.spec_from_file_location(
     "booru_video_importer", PLUGIN_DIR / "BooruVideoImporter.py"
