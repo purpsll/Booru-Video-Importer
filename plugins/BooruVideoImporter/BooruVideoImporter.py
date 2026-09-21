@@ -28,15 +28,18 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from stash_client import Stash, fingerprint, primary_video
+from source_index import load_cache, save_cache, scene_signature
 from video_match import (
     DEFAULT_RATIOS,
+    early_frame_hashes,
+    early_hash_candidate,
     extract_jpeg_frame,
     frame_hashes,
     probe_duration,
     verify_video_candidate,
 )
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -62,6 +65,9 @@ MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
 VERIFY_FRAME_DISTANCE = 8
+E621_SOURCE_PAGE_SIZE = 75
+E621_SOURCE_MAX_CANDIDATES = 5
+E621_SOURCE_EARLY_DISTANCE = 10
 
 _LAST_E621_REQUEST = 0.0
 _LAST_E621_ERIS = 0.0
