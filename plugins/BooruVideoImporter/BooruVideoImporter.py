@@ -251,19 +251,14 @@ def e621_video_posts_page(
     api_key: str,
     before_id: Optional[int] = None,
     limit: int = E621_SOURCE_PAGE_SIZE,
-    tag_filter: str = "",
 ) -> List[Dict[str, Any]]:
     """Fetch one source-first page of current e621 WebM/MP4 posts."""
     merged: Dict[str, Dict[str, Any]] = {}
     limit = max(1, min(320, int(limit)))
 
-    tag_filter = " ".join(str(tag_filter or "").split())
     for ext in ("webm", "mp4"):
-        query_tags = f"type:{ext}"
-        if tag_filter:
-            query_tags = f"{query_tags} {tag_filter}"
         params: Dict[str, str] = {
-            "tags": query_tags,
+            "tags": f"type:{ext}",
             "limit": str(limit),
             "v2": "true",
             "mode": "extended",
@@ -957,6 +952,22 @@ def discover_candidates(
 
 
 
+def resolve_stash_tag_filter(
+    stash: Stash,
+    tag_name: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a Stash tag name or alias to its canonical tag ID/name."""
+    tag_name = " ".join(str(tag_name or "").split())
+    if not tag_name:
+        return None, None
+
+    tags = stash.all_tags()
+    tag = tags.get(tag_name.casefold())
+    if not tag:
+        return None, None
+    return str(tag.get("id") or ""), str(tag.get("name") or tag_name)
+
+
 def build_local_source_index(
     stash: Stash,
     settings: Dict[str, Any],
@@ -965,6 +976,25 @@ def build_local_source_index(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Build or refresh the cached early-frame index for eligible local scenes."""
     ffmpeg_path = stash.ffmpeg_path()
+    stash_tag_filter = " ".join(
+        str(settings.get("stash_source_tag_filter") or "").split()
+    )
+    filter_tag_id: Optional[str] = None
+    filter_tag_name: Optional[str] = None
+    if stash_tag_filter:
+        filter_tag_id, filter_tag_name = resolve_stash_tag_filter(
+            stash,
+            stash_tag_filter,
+        )
+        if not filter_tag_id:
+            raise RuntimeError(
+                f"Stash tag filter not found: {stash_tag_filter}"
+            )
+        log(
+            "INFO",
+            f"Local source-first scope: Stash tag '{filter_tag_name}'",
+        )
+
     cache = load_cache()
     cached = cache.setdefault("scenes", {})
     if not isinstance(cached, dict):
@@ -985,7 +1015,11 @@ def build_local_source_index(
     page = 1
     per_page = 100
     while True:
-        count, scenes = stash.find_scenes(page, per_page)
+        count, scenes = stash.find_scenes(
+            page,
+            per_page,
+            tag_id=filter_tag_id,
+        )
         if not scenes:
             break
 
@@ -1087,7 +1121,9 @@ def build_local_source_index(
     log(
         "INFO",
         "Local source-first index: "
-        f"{len(rows)} eligible; {stats['indexed']} built; {stats['reused']} reused; "
+        f"{len(rows)} eligible"
+        + (f" with Stash tag '{filter_tag_name}'" if filter_tag_name else "")
+        + f"; {stats['indexed']} built; {stats['reused']} reused; "
         f"{stats['skipped_organized']} organized protected; {stats['errors']} errors",
     )
     return rows, stats
@@ -1177,8 +1213,8 @@ def source_first_e621(
         0.0,
         as_float(settings.get("source_first_duration_tolerance_seconds"), 1.0),
     )
-    source_tag_filter = " ".join(
-        str(settings.get("e621_source_tag_filter") or "").split()
+    stash_tag_filter = " ".join(
+        str(settings.get("stash_source_tag_filter") or "").split()
     )
     source_pages = max(
         1,
@@ -1215,9 +1251,6 @@ def source_first_e621(
         log("INFO", "e621 source-first scan stopped: no eligible local scenes in index")
         return stats
 
-    if source_tag_filter:
-        log("INFO", f"e621 source-first filter: {source_tag_filter}")
-
     before_id: Optional[int] = None
     stop = False
     for page_number in range(source_pages):
@@ -1227,7 +1260,6 @@ def source_first_e621(
                 api_key,
                 before_id=before_id,
                 limit=E621_SOURCE_PAGE_SIZE,
-                tag_filter=source_tag_filter,
             )
         except Exception as exc:
             stats["provider_errors"] += 1
