@@ -39,7 +39,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -64,10 +64,10 @@ DISCOVERY_RATIOS = (0.12, 0.32, 0.52, 0.72, 0.88)
 MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
-VERIFY_FRAME_DISTANCE = 24
+VERIFY_FRAME_DISTANCE = 16
 E621_SOURCE_PAGE_SIZE = 75
 E621_SOURCE_MAX_CANDIDATES = 5
-E621_SOURCE_EARLY_DISTANCE = 6
+E621_SOURCE_EARLY_DISTANCE = 4
 
 _LAST_E621_REQUEST = 0.0
 _LAST_E621_ERIS = 0.0
@@ -250,14 +250,19 @@ def e621_video_posts_page(
     api_key: str,
     before_id: Optional[int] = None,
     limit: int = E621_SOURCE_PAGE_SIZE,
+    tag_filter: str = "",
 ) -> List[Dict[str, Any]]:
     """Fetch one source-first page of current e621 WebM/MP4 posts."""
     merged: Dict[str, Dict[str, Any]] = {}
     limit = max(1, min(320, int(limit)))
 
+    tag_filter = " ".join(str(tag_filter or "").split())
     for ext in ("webm", "mp4"):
+        query_tags = f"type:{ext}"
+        if tag_filter:
+            query_tags = f"{query_tags} {tag_filter}"
         params: Dict[str, str] = {
-            "tags": f"type:{ext}",
+            "tags": query_tags,
             "limit": str(limit),
             "v2": "true",
             "mode": "extended",
@@ -1143,7 +1148,7 @@ def source_first_local_candidates(
         # Stash scene must be close in duration before an early visual hit can
         # become a full-video candidate. This prevents generic-looking clips from
         # reaching verification on frame similarity alone.
-        if duration_delta > 0.15:
+        if duration_delta > 0.03:
             continue
 
         rank = (
@@ -1169,7 +1174,10 @@ def source_first_e621(
     configured_pages = as_int(settings.get("e621_source_pages"), 5)
     duration_tolerance = max(
         0.0,
-        as_float(settings.get("source_first_duration_tolerance_seconds"), 2.0),
+        as_float(settings.get("source_first_duration_tolerance_seconds"), 1.0),
+    )
+    source_tag_filter = " ".join(
+        str(settings.get("e621_source_tag_filter") or "").split()
     )
     source_pages = max(
         1,
@@ -1206,6 +1214,9 @@ def source_first_e621(
         log("INFO", "e621 source-first scan stopped: no eligible local scenes in index")
         return stats
 
+    if source_tag_filter:
+        log("INFO", f"e621 source-first filter: {source_tag_filter}")
+
     before_id: Optional[int] = None
     stop = False
     for page_number in range(source_pages):
@@ -1215,6 +1226,7 @@ def source_first_e621(
                 api_key,
                 before_id=before_id,
                 limit=E621_SOURCE_PAGE_SIZE,
+                tag_filter=source_tag_filter,
             )
         except Exception as exc:
             stats["provider_errors"] += 1
