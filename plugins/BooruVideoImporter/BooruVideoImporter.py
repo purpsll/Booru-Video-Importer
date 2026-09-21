@@ -1380,6 +1380,7 @@ def build_source_index_task(
     )
     return stats
 
+
 def process_scene(
     stash: Stash,
     scene: Dict[str, Any],
@@ -1612,9 +1613,14 @@ def main() -> None:
     settings = stash.settings()
     args = payload.get("args") or {}
     mode = str(args.get("mode") or "import_all")
-    if mode != "import_all":
+    if mode == "import_all":
+        stats = import_all(stash, settings, args)
+    elif mode == "build_source_index":
+        stats = build_source_index_task(stash, settings, args)
+    elif mode == "source_first_e621":
+        stats = source_first_e621(stash, settings, args)
+    else:
         raise RuntimeError(f"Unsupported mode: {mode}")
-    stats = import_all(stash, settings, args)
     log("INFO", f"Finished Booru Video Importer: {stats}")
     print(json.dumps({"output": "ok", "stats": stats}))
 
