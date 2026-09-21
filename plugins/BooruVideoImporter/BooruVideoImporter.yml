@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and e621 source-first matching that compares early video frames against a cached local Stash frame index before full multi-frame verification.
-version: 1.2.0
+description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and exhaustive Stash-first e621 matching by exact duration and aligned video frames.
+version: 1.3.0
 
 exec:
   - python
@@ -20,14 +20,9 @@ settings:
     description: When enabled, any Stash scene already marked Organized is skipped completely. The plugin will not add tags, performers, studio, URLs, dates, or workflow markers to that scene.
     type: BOOLEAN
 
-  source_first_auto_import:
-    displayName: Allow Source-First Auto Import
-    description: Off by default for safety. When disabled, even high-confidence e621 source-first matches are sent to Booru Video Review instead of writing source metadata automatically.
-    type: BOOLEAN
-
   e621_source_pages:
-    displayName: e621 Source-First Pages per Run
-    description: Number of historical e621 pages to inspect per run. Full runs remember a separate backward cursor for each Stash Tag Scope and continue older on the next run. Leave 0 or blank to use 5 pages.
+    displayName: e621 History Pages per Stash Video per Run
+    description: How many historical e621 video pages to inspect for the current local Stash video before saving progress. The next run resumes the same Stash video until it matches or e621 history is exhausted. Leave 0 or blank to use 5 pages.
     type: NUMBER
 
   e621_username:
@@ -105,22 +100,22 @@ tasks:
       mode: build_source_index
       force_index: false
 
-  - name: 7. Preview e621 Source-First Match (25 Posts, No Changes)
-    description: Previews up to 25 e621 video posts from the current saved history cursor without advancing it. e621 duration metadata must exactly match a local Stash duration after millisecond normalization before the remote video is ever opened.
+  - name: 7. Preview Stash-First e621 Match (1 Video, No Changes)
+    description: Takes the next filtered local Stash video, reads its exact millisecond duration, scans one page of e621 videos, ignores every non-exact-duration post before opening media, then compares same-timecode frames for exact-duration candidates. Makes no metadata or cursor changes.
     defaultArgs:
-      mode: source_first_e621
+      mode: stash_first_e621
       dry_run: true
       source_pages: 1
-      source_post_limit: 25
+      local_limit: 1
 
-  - name: 8. Continue e621 History Match to Local Stash
-    description: Continues backward through e621 video history for the selected Stash Tag Scope. Posts with missing duration or without an exact local millisecond-duration match are skipped before any remote frame/video scan. Progress is saved and the next run continues older.
+  - name: 8. Match Filtered Stash Videos Against e621 History
+    description: Processes one filtered Stash video at a time. For that file it walks e621 video history from newest to oldest, skips all non-exact-duration videos before frame scanning, tests exact-duration candidates sequentially, stops at the first verified match and imports all authoritative metadata, then starts the next local video. If no match exists in all e621 history, it moves to the next local video.
     defaultArgs:
-      mode: source_first_e621
+      mode: stash_first_e621
       dry_run: false
 
-  - name: 9. Reset e621 Source-First Cursor
-    description: Resets the saved e621 history position for the current Stash Tag Scope so the next source-first run starts from the newest e621 videos again. Use this after adding local videos when you want older already-scanned e621 history reconsidered.
+  - name: 9. Reset Stash-First e621 Progress
+    description: Clears saved per-video e621 history progress for the current Stash Tag Scope. The next run starts the first eligible local video against e621 from newest again.
     defaultArgs:
       mode: reset_source_cursor
 
