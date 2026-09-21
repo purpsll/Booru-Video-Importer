@@ -226,6 +226,8 @@ def verify_video_candidate(
     timeout: int = 45,
     local_duration: float | None = None,
     local_hashes: List[int] | None = None,
+    remote_duration: float | None = None,
+    remote_hashes: List[int] | None = None,
 ) -> Dict[str, object]:
     """Compare several perceptual frames while tolerating modest trim/timing shifts.
 
@@ -234,9 +236,9 @@ def verify_video_candidate(
     """
     ratios = tuple(ratios)
     local_duration = local_duration or probe_duration(local_source, ffmpeg_path, timeout)
-    remote_duration = probe_duration(remote_source, ffmpeg_path, timeout)
+    remote_duration = remote_duration or probe_duration(remote_source, ffmpeg_path, timeout)
     local_hashes = local_hashes or frame_hashes(local_source, local_duration, ffmpeg_path, ratios, timeout)
-    remote_hashes = frame_hashes(remote_source, remote_duration, ffmpeg_path, ratios, timeout)
+    remote_hashes = remote_hashes or frame_hashes(remote_source, remote_duration, ffmpeg_path, ratios, timeout)
 
     nearest: List[int] = []
     for local_hash in local_hashes:
