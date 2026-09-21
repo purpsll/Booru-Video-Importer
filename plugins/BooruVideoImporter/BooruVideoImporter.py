@@ -1168,6 +1168,7 @@ def source_first_e621(
         "video_posts": 0,
         "early_candidates": 0,
         "verified_matches": 0,
+        "high_confidence_review": 0,
         "review_candidates": 0,
         "provider_errors": 0,
         "local_index_size": len(local_index),
@@ -1312,7 +1313,18 @@ def source_first_e621(
                 )
 
                 if verification.get("high"):
-                    if not dry_run:
+                    auto_import = as_bool(
+                        settings.get("source_first_auto_import"),
+                        False,
+                    )
+                    if dry_run:
+                        stats["verified_matches"] += 1
+                        log(
+                            "INFO",
+                            f"e621 source-first VERIFIED: post #{post.get('id')} -> "
+                            f"Stash Scene {entry['scene_id']} (preview only)",
+                        )
+                    elif auto_import:
                         apply_metadata(
                             stash,
                             scene,
@@ -1324,14 +1336,28 @@ def source_first_e621(
                             studio_cache,
                             False,
                         )
-                    stats["verified_matches"] += 1
+                        stats["verified_matches"] += 1
+                        log(
+                            "INFO",
+                            f"e621 source-first MATCH: post #{post.get('id')} -> "
+                            f"Stash Scene {entry['scene_id']}",
+                        )
+                    else:
+                        transition_status(
+                            stash,
+                            scene,
+                            STATUS_REVIEW,
+                            tag_cache,
+                            extra_url=canonical_post_url("e621", post),
+                        )
+                        stats["high_confidence_review"] += 1
+                        log(
+                            "INFO",
+                            f"e621 source-first VERIFIED REVIEW: post #{post.get('id')} -> "
+                            f"Stash Scene {entry['scene_id']} "
+                            "(auto-import disabled)",
+                        )
                     matched_entry = entry
-                    log(
-                        "INFO",
-                        f"e621 source-first MATCH: post #{post.get('id')} -> "
-                        f"Stash Scene {entry['scene_id']}"
-                        + (" (preview only)" if dry_run else ""),
-                    )
                     break
 
                 if verification.get("review"):
