@@ -44,7 +44,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 E621_BASE = "https://e621.net"
 E621_PAGE_SIZE = 75
@@ -168,6 +168,7 @@ def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ext": str(legacy.get("ext") or "").casefold().lstrip("."),
             "url": str(legacy.get("url") or "").strip(),
+            "md5": str(legacy.get("md5") or "").strip().casefold(),
             "duration": as_float(
                 legacy.get("duration") or post.get("duration"), 0.0
             ),
@@ -182,10 +183,59 @@ def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
             "url": str(
                 original.get("url") if isinstance(original, dict) else ""
             ).strip(),
+            "md5": str(meta.get("md5") or "").strip().casefold(),
             "duration": as_float(meta.get("duration"), 0.0),
         }
 
-    return {"ext": "", "url": "", "duration": 0.0}
+    return {"ext": "", "url": "", "md5": "", "duration": 0.0}
+
+
+def e621_post_by_md5(
+    md5: str,
+    username: str,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact e621 video post for a byte-identical local file."""
+    md5 = str(md5 or "").strip().casefold()
+    if not md5:
+        return None
+
+    params = urllib.parse.urlencode(
+        {
+            "tags": f"md5:{md5}",
+            "limit": "1",
+            "v2": "true",
+            "mode": "extended",
+        }
+    )
+    payload = e621_request(
+        f"{E621_BASE}/posts.json?{params}",
+        username,
+        api_key,
+    )
+    for post in _e621_posts(payload):
+        info = e621_file_info(post)
+        if (
+            info.get("md5") == md5
+            and info.get("ext") in VIDEO_EXTENSIONS
+            and info.get("url")
+        ):
+            return post
+    return None
+
+
+def video_file_fingerprint(
+    video: Dict[str, Any],
+    kind: str,
+) -> Optional[str]:
+    """Read a fingerprint from the exact Stash file currently being processed."""
+    target = str(kind or "").casefold()
+    for fingerprint in video.get("fingerprints") or []:
+        if str(fingerprint.get("type") or "").casefold() == target:
+            value = str(fingerprint.get("value") or "").strip()
+            if value:
+                return value
+    return None
 
 
 def e621_video_posts_page(
@@ -689,6 +739,10 @@ def match_stash_against_e621(
         "local_videos_started": 0,
         "local_videos_matched": 0,
         "local_videos_exhausted": 0,
+        "md5_checked": 0,
+        "md5_exact_matches": 0,
+        "md5_unavailable": 0,
+        "md5_lookup_errors": 0,
         "e621_posts_seen": 0,
         "duration_filtered": 0,
         "duration_unknown": 0,
@@ -714,6 +768,75 @@ def match_stash_against_e621(
         current_ext = active_ext if resume_this_scene else "webm"
         before_id = active_before_id if resume_this_scene else None
 
+        stats["local_videos_started"] += 1
+
+        video = primary_video(scene)
+        local_md5 = video_file_fingerprint(video or {}, "md5")
+        if local_md5:
+            stats["md5_checked"] += 1
+            try:
+                exact_post = e621_post_by_md5(
+                    local_md5,
+                    username,
+                    api_key,
+                )
+            except Exception as exc:
+                exact_post = None
+                stats["md5_lookup_errors"] += 1
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"Scene {scene_id}: direct e621 MD5 lookup failed: {exc}; "
+                    "falling back to duration/frame search",
+                )
+
+            if exact_post is not None:
+                post_id = as_int(exact_post.get("id"), 0)
+                stats["md5_exact_matches"] += 1
+                stats["local_videos_matched"] += 1
+                if dry_run:
+                    log(
+                        "INFO",
+                        f"Scene {scene_id}: exact file MD5 matched e621 "
+                        f"#{post_id} (preview only; no changes)",
+                    )
+                    break
+
+                apply_e621_metadata(
+                    stash,
+                    scene,
+                    exact_post,
+                    settings,
+                    tag_cache,
+                    performer_cache,
+                    studio_cache,
+                )
+                completed_scene_ids.append(scene_id)
+                _save_scope_state(
+                    state,
+                    scope_key,
+                    scene_id=None,
+                    ext="webm",
+                    before_id=None,
+                    completed_scene_ids=completed_scene_ids,
+                )
+                log(
+                    "INFO",
+                    f"Scene {scene_id}: exact file MD5 matched e621 "
+                    f"#{post_id}; metadata attached without history scan",
+                )
+                active_scene_id = None
+                active_ext = "webm"
+                active_before_id = None
+                continue
+        else:
+            stats["md5_unavailable"] += 1
+            log(
+                "INFO",
+                f"Scene {scene_id}: no MD5 fingerprint on primary video file; "
+                "using duration/frame search",
+            )
+
         try:
             entry = _prepare_local_entry(
                 scene,
@@ -727,7 +850,6 @@ def match_stash_against_e621(
             log("WARNING", f"Scene {scene_id}: local preparation failed: {exc}")
             break
 
-        stats["local_videos_started"] += 1
         log(
             "INFO",
             f"Scene {scene_id}: searching all e621 video history for exact "
