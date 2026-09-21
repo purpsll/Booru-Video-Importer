@@ -17,3 +17,10 @@ plugins/BooruVideoImporter/booru_video_hash_index.json
 
 # Runtime e621 history cursor
 plugins/BooruVideoImporter/booru_video_scan_state.json
+
+
+# Booru Video Importer runtime databases/caches (normally stored outside plugin dir)
+**/e621_video_catalog.sqlite
+**/e621_video_catalog.sqlite-shm
+**/e621_video_catalog.sqlite-wal
+**/booru_video_hash_index.json
