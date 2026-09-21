@@ -44,6 +44,11 @@ def _timestamp(duration: float, ratio: float) -> float:
     return max(0.05, min(max(0.05, duration - 0.05), duration * float(ratio)))
 
 
+def frame_timestamp_seconds(duration: float, ratio: float) -> float:
+    """Return the exact clamped timestamp used for proportional frame sampling."""
+    return _timestamp(duration, ratio)
+
+
 def extract_jpeg_frame(
     source: str,
     duration: float,
