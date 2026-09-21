@@ -64,7 +64,8 @@ DISCOVERY_RATIOS = (0.12, 0.32, 0.52, 0.72, 0.88)
 MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
-VERIFY_FRAME_DISTANCE = 16
+VERIFY_FRAME_DISTANCE = 24
+SOURCE_FIRST_VERIFY_FRAME_DISTANCE = 16
 E621_SOURCE_PAGE_SIZE = 75
 E621_SOURCE_MAX_CANDIDATES = 5
 E621_SOURCE_EARLY_DISTANCE = 4
@@ -1352,12 +1353,13 @@ def source_first_e621(
                         remote_url,
                         ffmpeg_path=ffmpeg_path,
                         ratios=DEFAULT_RATIOS,
-                        frame_distance=VERIFY_FRAME_DISTANCE,
+                        frame_distance=SOURCE_FIRST_VERIFY_FRAME_DISTANCE,
                         timeout=60,
                         local_duration=float(entry["duration"]),
                         local_hashes=local_full_hashes,
                         remote_duration=remote_duration,
                         remote_hashes=remote_full_hashes,
+                        strict=True,
                     )
                 except Exception as exc:
                     stats["provider_errors"] += 1
