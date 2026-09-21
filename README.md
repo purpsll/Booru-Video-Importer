@@ -6,12 +6,13 @@ This repository is intentionally separate from the image-only **Booru Importer**
 
 ## What it does
 
-The plugin uses a conservative two-stage workflow:
+The plugin supports three conservative matching paths:
 
 1. **Fast Scan** checks the Stash video's MD5 against e621 and Rule34.
-2. **Deep Reverse Search** extracts representative frames with FFmpeg, uses SauceNAO and e621 ERIS to discover candidate posts, requires the candidate post to contain a video, and compares the local and remote videos across multiple perceptual frame hashes.
+2. **Deep Reverse Search** starts from a local Stash scene, extracts representative frames, uses SauceNAO plus a limited e621 ERIS fallback to locate candidate posts, then verifies the actual candidate video across multiple frames.
+3. **e621 Source-First Match** works in the opposite direction: it scans e621 WebM/MP4 posts, hashes early frames, compares them against a cached early-frame index of local Stash videos, and runs full multi-frame verification before importing anything.
 
-A single matching frame is **not enough** to automatically tag a scene. Borderline multi-frame matches are placed in **Booru Video Review**.
+A single matching frame is **never enough** to automatically tag a scene. Borderline multi-frame matches are placed in **Booru Video Review**.
 
 ## Metadata
 
@@ -38,10 +39,20 @@ Refresh plugin sources and install **Booru Video Importer**.
 
 ## Recommended workflow
 
+For local-first matching:
+
 1. **Scan Unprocessed Videos (Fast)**
 2. **Preview Deep Reverse Search (10 Videos, No Changes)**
 3. **Deep Reverse Search All Unresolved Videos**
 4. Review scenes tagged **Booru Video Review**
+
+For e621 source-first matching:
+
+1. **Build / Refresh Local Video Frame Index**
+2. **Preview e621 Source-First Match (25 Posts, No Changes)**
+3. **Match e621 Videos to Local Stash**
+
+The local frame index is cached and unchanged files reuse their hashes on later runs.
 
 The plugin uses its own status tags and does not share queues with the image Booru Importer.
 
@@ -54,6 +65,12 @@ For best results configure:
 - SauceNAO API key
 
 SauceNAO is used only for candidate discovery. Imported metadata always comes from the matched source post.
+
+## Protect Organized Scenes
+
+Enable **Protect Organized Scenes** in the plugin settings if Stash's Organized flag means a scene is finished and should be left alone.
+
+When enabled, an Organized scene is completely read-only to this plugin: no tags, performers, studio, URLs, dates, or workflow markers are added or changed.
 
 ## Safety
 
