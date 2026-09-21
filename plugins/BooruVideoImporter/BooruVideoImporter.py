@@ -45,7 +45,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -1212,6 +1212,7 @@ def _load_source_cursor(scope_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]
     if not isinstance(scope_state, dict):
         scope_state = {}
         scopes[scope_key] = scope_state
+    scope_state.setdefault("completed_scene_ids", [])
     return state, scope_state
 
 
@@ -1219,13 +1220,15 @@ def _save_source_cursor(
     state: Dict[str, Any],
     scope_key: str,
     *,
+    scene_id: Optional[str],
     before_id: Optional[int],
-    exhausted: bool,
+    completed_scene_ids: Sequence[str],
 ) -> None:
     scopes = state.setdefault("scopes", {})
     scopes[scope_key] = {
+        "scene_id": str(scene_id) if scene_id else None,
         "before_id": int(before_id) if before_id else None,
-        "exhausted": bool(exhausted),
+        "completed_scene_ids": sorted({str(value) for value in completed_scene_ids}),
         "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
     save_scan_state(state)
@@ -1241,8 +1244,27 @@ def reset_source_cursor(
     existed = scope_key in scopes
     scopes.pop(scope_key, None)
     save_scan_state(state)
-    log("INFO", f"Reset e621 source-first cursor for {scope_label}")
+    log("INFO", f"Reset e621 Stash-first history state for {scope_label}")
     return {"cursor_reset": 1 if existed else 0, "scope": scope_label}
+
+
+def _ordered_local_entries(
+    local_index: Sequence[Dict[str, Any]],
+    completed_scene_ids: Sequence[str],
+    active_scene_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    completed = {str(value) for value in completed_scene_ids}
+    eligible = [
+        entry for entry in local_index
+        if str(entry.get("scene_id") or "") not in completed
+    ]
+    eligible.sort(key=lambda entry: as_int(entry.get("scene_id"), 0))
+
+    if active_scene_id:
+        for index, entry in enumerate(eligible):
+            if str(entry.get("scene_id") or "") == str(active_scene_id):
+                return [entry] + eligible[:index] + eligible[index + 1:]
+    return eligible
 
 
 
@@ -1282,6 +1304,352 @@ def source_first_local_candidates(
 
     ranked.sort(key=lambda item: item[0], reverse=True)
     return ranked[:E621_SOURCE_MAX_CANDIDATES]
+
+
+def stash_first_e621(
+    stash: Stash,
+    settings: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, int]:
+    """Match each filtered Stash video against all e621 videos of exact duration.
+
+    The active local scene is kept until an authoritative match is found or e621
+    video history is exhausted for that scene. State persists between runs.
+    """
+    dry_run = as_bool(args.get("dry_run"), False)
+    force_index = as_bool(args.get("force_index"), False)
+    configured_pages = as_int(settings.get("e621_source_pages"), 5)
+    pages_per_run = max(
+        1,
+        min(100, as_int(args.get("source_pages"), configured_pages or 5)),
+    )
+    local_limit = max(0, as_int(args.get("local_limit"), 0))
+    username = str(settings.get("e621_username") or "")
+    api_key = str(settings.get("e621_api_key") or "")
+    ffmpeg_path = stash.ffmpeg_path()
+
+    local_index, index_stats = build_local_source_index(
+        stash,
+        settings,
+        force=force_index,
+    )
+    scope_key, scope_label = _source_cursor_scope(stash, settings)
+    scan_state, scope_state = _load_source_cursor(scope_key)
+    active_scene_id = str(scope_state.get("scene_id") or "") or None
+    before_id = as_int(scope_state.get("before_id"), 0) or None
+    completed_scene_ids = [
+        str(value)
+        for value in scope_state.get("completed_scene_ids") or []
+    ]
+
+    tag_cache = stash.all_tags()
+    performer_cache = stash.all_performers()
+    studio_cache = stash.all_studios()
+
+    stats = {
+        "local_scenes_seen": 0,
+        "local_scenes_completed": 0,
+        "local_scenes_matched": 0,
+        "local_scenes_no_match": 0,
+        "e621_posts_seen": 0,
+        "e621_exact_duration_candidates": 0,
+        "e621_duration_filtered": 0,
+        "e621_duration_unknown": 0,
+        "frame_candidates": 0,
+        "provider_errors": 0,
+        "local_index_size": len(local_index),
+        "organized_protected": int(index_stats.get("skipped_organized") or 0),
+    }
+
+    entries = _ordered_local_entries(
+        local_index,
+        completed_scene_ids,
+        active_scene_id,
+    )
+    if local_limit:
+        entries = entries[:local_limit]
+    if not entries:
+        log("INFO", f"No remaining eligible Stash videos for {scope_label}")
+        return stats
+
+    for entry in entries:
+        scene = entry["scene"]
+        scene_id = str(entry["scene_id"])
+        local_duration = float(entry["duration"])
+        local_duration_ms = duration_milliseconds(local_duration)
+        if local_duration_ms <= 0:
+            completed_scene_ids.append(scene_id)
+            stats["local_scenes_completed"] += 1
+            continue
+
+        stats["local_scenes_seen"] += 1
+        scene_before_id = before_id if active_scene_id == scene_id else None
+
+        log(
+            "INFO",
+            f"Scene {scene_id}: searching e621 video history for exact duration "
+            f"{local_duration_ms} ms starting at "
+            f"{scene_before_id or 'newest'}",
+        )
+
+        # Cache local comparison hashes once for this active Stash file.
+        try:
+            local_early = entry.get("hashes") or early_frame_hashes(
+                str(entry["path"]),
+                local_duration,
+                ffmpeg_path=ffmpeg_path,
+                timeout=45,
+            )
+            local_full = entry.get("_full_hashes")
+            if not isinstance(local_full, list) or not local_full:
+                local_full = frame_hashes(
+                    str(entry["path"]),
+                    local_duration,
+                    ffmpeg_path=ffmpeg_path,
+                    ratios=DEFAULT_RATIOS,
+                    timeout=45,
+                )
+                entry["_full_hashes"] = local_full
+        except Exception as exc:
+            stats["provider_errors"] += 1
+            log("WARNING", f"Scene {scene_id}: local frame extraction failed: {exc}")
+            break
+
+        matched = False
+        exhausted = False
+        pages_scanned = 0
+
+        while pages_scanned < pages_per_run and not matched:
+            try:
+                posts = e621_video_posts_page(
+                    username,
+                    api_key,
+                    before_id=scene_before_id,
+                    limit=E621_SOURCE_PAGE_SIZE,
+                )
+            except Exception as exc:
+                stats["provider_errors"] += 1
+                log("WARNING", f"Scene {scene_id}: e621 history lookup failed: {exc}")
+                break
+
+            if not posts:
+                exhausted = True
+                break
+
+            pages_scanned += 1
+            last_processed_id: Optional[int] = None
+
+            for post in posts:
+                post_id = as_int(post.get("id"), 0)
+                if post_id > 0:
+                    last_processed_id = post_id
+                stats["e621_posts_seen"] += 1
+
+                info = e621_file_info(post)
+                remote_duration = as_float(info.get("duration"), 0.0)
+                remote_duration_ms = duration_milliseconds(remote_duration)
+
+                # Duration is the first and mandatory filter. Do not open remote
+                # media unless it exactly matches the active local scene.
+                if remote_duration_ms <= 0:
+                    stats["e621_duration_unknown"] += 1
+                    continue
+                if remote_duration_ms != local_duration_ms:
+                    stats["e621_duration_filtered"] += 1
+                    continue
+
+                remote_url = media_url("e621", post)
+                if not remote_url:
+                    continue
+
+                stats["e621_exact_duration_candidates"] += 1
+                log(
+                    "INFO",
+                    f"Scene {scene_id}: e621 #{post.get('id')} exact duration "
+                    f"{remote_duration_ms} ms; comparing same-timecode frames",
+                )
+
+                try:
+                    remote_early = early_frame_hashes(
+                        remote_url,
+                        remote_duration,
+                        ffmpeg_path=ffmpeg_path,
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    stats["provider_errors"] += 1
+                    log(
+                        "WARNING",
+                        f"Scene {scene_id}: e621 #{post.get('id')} early frame "
+                        f"comparison failed: {exc}",
+                    )
+                    continue
+
+                early = early_hash_candidate(
+                    local_early,
+                    remote_early,
+                    max_distance=E621_SOURCE_EARLY_DISTANCE,
+                )
+                if not early.get("candidate"):
+                    log(
+                        "INFO",
+                        f"Scene {scene_id}: e621 #{post.get('id')} same duration "
+                        f"but early aligned frames did not match; checking next file",
+                    )
+                    continue
+
+                stats["frame_candidates"] += 1
+                try:
+                    remote_full = frame_hashes(
+                        remote_url,
+                        remote_duration,
+                        ffmpeg_path=ffmpeg_path,
+                        ratios=DEFAULT_RATIOS,
+                        timeout=60,
+                    )
+                    verification = verify_video_candidate(
+                        str(entry["path"]),
+                        remote_url,
+                        ffmpeg_path=ffmpeg_path,
+                        ratios=DEFAULT_RATIOS,
+                        frame_distance=SOURCE_FIRST_VERIFY_FRAME_DISTANCE,
+                        timeout=60,
+                        local_duration=local_duration,
+                        local_hashes=local_full,
+                        remote_duration=remote_duration,
+                        remote_hashes=remote_full,
+                        strict=True,
+                    )
+                except Exception as exc:
+                    stats["provider_errors"] += 1
+                    log(
+                        "WARNING",
+                        f"Scene {scene_id}: e621 #{post.get('id')} verification "
+                        f"failed: {exc}",
+                    )
+                    continue
+
+                log(
+                    "INFO",
+                    f"Scene {scene_id}: e621 #{post.get('id')} verification "
+                    f"{verification.get('matched_frames')}/"
+                    f"{verification.get('total_frames')} aligned frames, "
+                    f"median {verification.get('median_distance')}",
+                )
+
+                if not verification.get("high"):
+                    log(
+                        "INFO",
+                        f"Scene {scene_id}: e621 #{post.get('id')} rejected; "
+                        "checking next exact-duration e621 video",
+                    )
+                    continue
+
+                matched = True
+                stats["local_scenes_matched"] += 1
+                stats["local_scenes_completed"] += 1
+                completed_scene_ids.append(scene_id)
+
+                if dry_run:
+                    log(
+                        "INFO",
+                        f"Scene {scene_id}: VERIFIED e621 #{post.get('id')} "
+                        "(preview only; no metadata/state changes)",
+                    )
+                else:
+                    apply_metadata(
+                        stash,
+                        scene,
+                        "e621",
+                        post,
+                        settings,
+                        tag_cache,
+                        performer_cache,
+                        studio_cache,
+                        False,
+                    )
+                    log(
+                        "INFO",
+                        f"Scene {scene_id}: MATCH e621 #{post.get('id')}; "
+                        "authoritative metadata attached",
+                    )
+                break
+
+            if matched:
+                break
+
+            if last_processed_id:
+                scene_before_id = last_processed_id
+            else:
+                exhausted = True
+                break
+
+            # Save after every page only for real runs. The active local scene is
+            # retained, so another invocation continues this same file.
+            if not dry_run:
+                _save_source_cursor(
+                    scan_state,
+                    scope_key,
+                    scene_id=scene_id,
+                    before_id=scene_before_id,
+                    completed_scene_ids=completed_scene_ids,
+                )
+
+        if dry_run:
+            # Preview never changes cursor/completion state and stops after one
+            # local file so the result is easy to inspect.
+            break
+
+        if matched:
+            active_scene_id = None
+            before_id = None
+            _save_source_cursor(
+                scan_state,
+                scope_key,
+                scene_id=None,
+                before_id=None,
+                completed_scene_ids=completed_scene_ids,
+            )
+            # Move immediately to the next local file and start e621 from newest.
+            continue
+
+        if exhausted:
+            stats["local_scenes_no_match"] += 1
+            stats["local_scenes_completed"] += 1
+            completed_scene_ids.append(scene_id)
+            log(
+                "INFO",
+                f"Scene {scene_id}: no verified e621 video match after exhausting "
+                "e621 video history; moving to next Stash video",
+            )
+            _save_source_cursor(
+                scan_state,
+                scope_key,
+                scene_id=None,
+                before_id=None,
+                completed_scene_ids=completed_scene_ids,
+            )
+            active_scene_id = None
+            before_id = None
+            continue
+
+        # Page budget reached before e621 history was exhausted. Persist this
+        # scene and resume it next run; do not move to another local file.
+        _save_source_cursor(
+            scan_state,
+            scope_key,
+            scene_id=scene_id,
+            before_id=scene_before_id,
+            completed_scene_ids=completed_scene_ids,
+        )
+        log(
+            "INFO",
+            f"Scene {scene_id}: page budget reached; next run resumes this same "
+            f"Stash video at e621 before_id {scene_before_id}",
+        )
+        break
+
+    return stats
 
 
 def source_first_e621(
@@ -1934,6 +2302,8 @@ def main() -> None:
         stats = build_source_index_task(stash, settings, args)
     elif mode == "source_first_e621":
         stats = source_first_e621(stash, settings, args)
+    elif mode == "stash_first_e621":
+        stats = stash_first_e621(stash, settings, args)
     elif mode == "reset_source_cursor":
         stats = reset_source_cursor(stash, settings)
     else:
