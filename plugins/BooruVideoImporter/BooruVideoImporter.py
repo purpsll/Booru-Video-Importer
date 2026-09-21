@@ -691,6 +691,14 @@ def post_metadata(source: str, post: Dict[str, Any], settings: Dict[str, Any]) -
     }
 
 
+def skip_organized_enabled(settings: Dict[str, Any]) -> bool:
+    return as_bool(settings.get("skip_organized_scenes"), False)
+
+
+def protected_organized_scene(scene: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    return skip_organized_enabled(settings) and bool(scene.get("organized"))
+
+
 def _status_names(scene: Dict[str, Any]) -> set[str]:
     return {
         str(tag.get("name") or "").casefold()
@@ -763,6 +771,13 @@ def apply_metadata(
     studio_cache: Dict[str, Dict[str, Any]],
     dry_run: bool,
 ) -> None:
+    if protected_organized_scene(scene, settings):
+        log(
+            "INFO",
+            f"Scene {scene.get('id')}: Organized protection is enabled; metadata unchanged",
+        )
+        return
+
     metadata = post_metadata(source, post, settings)
 
     existing_tag_ids = [
@@ -939,6 +954,10 @@ def process_scene(
     studio_cache: Dict[str, Dict[str, Any]],
 ) -> str:
     sid = str(scene.get("id") or "")
+    if protected_organized_scene(scene, settings):
+        log("INFO", f"Scene {sid}: skipped because Stash marks it Organized")
+        return "skipped_organized"
+
     video = primary_video(scene)
     if not video:
         return "skipped"
@@ -1102,6 +1121,7 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         "no_match": 0,
         "retry_later": 0,
         "skipped": 0,
+        "skipped_organized": 0,
     }
 
     page = 1
