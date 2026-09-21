@@ -368,7 +368,7 @@ class VideoMatchTests(unittest.TestCase):
 
     def test_strict_source_first_requires_all_seven_frames(self):
         local = [0, 1, 2, 3, 4, 5, 6]
-        remote = [0, 1, 2, 3, 4, 5, 255]
+        remote = [0, 1, 2, 3, 4, 5, (1 << 256) - 1]
         result = video_match.verify_video_candidate(
             "local.mp4",
             "remote.mp4",
