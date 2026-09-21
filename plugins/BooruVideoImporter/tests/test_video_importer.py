@@ -338,5 +338,67 @@ class VideoMatchTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+    def test_dynamic_stash_tag_scope_accepts_any_name_or_alias(self):
+        stash = mock.Mock()
+        stash.all_tags.return_value = {
+            "furry": {"id": "77", "name": "Furry"},
+            "anthro": {"id": "77", "name": "Furry"},
+            "custom future tag": {"id": "88", "name": "Custom Future Tag"},
+        }
+
+        self.assertEqual(
+            plugin.resolve_stash_tag_filter(stash, "anthro"),
+            ("77", "Furry"),
+        )
+        self.assertEqual(
+            plugin.resolve_stash_tag_filter(stash, "Custom Future Tag"),
+            ("88", "Custom Future Tag"),
+        )
+
+    def test_scene_scope_membership_uses_tag_id(self):
+        scene = {
+            "tags": [
+                {"id": "77", "name": "Furry"},
+                {"id": "12", "name": "Other"},
+            ]
+        }
+        self.assertTrue(plugin.scene_has_tag_id(scene, "77"))
+        self.assertFalse(plugin.scene_has_tag_id(scene, "999"))
+        self.assertTrue(plugin.scene_has_tag_id(scene, None))
+
+    def test_strict_source_first_requires_all_seven_frames(self):
+        local = [0, 1, 2, 3, 4, 5, 6]
+        remote = [0, 1, 2, 3, 4, 5, 255]
+        result = video_match.verify_video_candidate(
+            "local.mp4",
+            "remote.mp4",
+            local_duration=100.0,
+            remote_duration=100.0,
+            local_hashes=local,
+            remote_hashes=remote,
+            frame_distance=16,
+            strict=True,
+        )
+        self.assertFalse(result["high"])
+
+    def test_strict_source_first_accepts_identical_aligned_frames_and_duration(self):
+        hashes = [
+            int.from_bytes(bytes([value]) * 32, "big")
+            for value in (0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66)
+        ]
+        result = video_match.verify_video_candidate(
+            "local.mp4",
+            "remote.mp4",
+            local_duration=100.0,
+            remote_duration=100.5,
+            local_hashes=hashes,
+            remote_hashes=list(hashes),
+            frame_distance=16,
+            strict=True,
+        )
+        self.assertTrue(result["high"])
+        self.assertEqual(result["matched_frames"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()
