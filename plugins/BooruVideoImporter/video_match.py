@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -41,6 +42,11 @@ def probe_duration(source: str, ffmpeg_path: str = "ffmpeg", timeout: int = 30) 
 
 def _timestamp(duration: float, ratio: float) -> float:
     return max(0.05, min(max(0.05, duration - 0.05), duration * float(ratio)))
+
+
+def frame_timestamp_seconds(duration: float, ratio: float) -> float:
+    """Return the exact clamped timestamp used for proportional frame sampling."""
+    return _timestamp(duration, ratio)
 
 
 def extract_jpeg_frame(
@@ -245,6 +251,108 @@ def frame_dhash(
             value = (value << 1) | (1 if left >= right else 0)
     return value
 
+
+
+_PHASH_SIZE = 32
+_PHASH_LOW = 8
+_PHASH_BASIS = [
+    [
+        math.cos((math.pi / _PHASH_SIZE) * (x + 0.5) * u)
+        for x in range(_PHASH_SIZE)
+    ]
+    for u in range(_PHASH_LOW)
+]
+
+
+def frame_phash(
+    source: str,
+    duration: float,
+    ratio: float,
+    ffmpeg_path: str = "ffmpeg",
+    timeout: int = 45,
+) -> int:
+    """Return a standard 64-bit DCT perceptual hash for one video frame."""
+    ts = _timestamp(duration, ratio)
+    vf = (
+        "scale=32:32:force_original_aspect_ratio=decrease,"
+        "pad=32:32:(ow-iw)/2:(oh-ih)/2,format=gray"
+    )
+    cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ts:.3f}", "-i", source,
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    raw = bytes(proc.stdout or b"")
+    expected = _PHASH_SIZE * _PHASH_SIZE
+    if proc.returncode != 0 or len(raw) < expected:
+        raise RuntimeError(
+            proc.stderr.decode("utf-8", errors="replace")[:300]
+            or "perceptual hash frame extraction failed"
+        )
+
+    # Separable 2-D DCT, limited to the 8x8 low-frequency coefficients used
+    # by pHash. Scaling constants are irrelevant because the final operation
+    # compares coefficients against their median.
+    pixels = [
+        [float(raw[y * _PHASH_SIZE + x]) for x in range(_PHASH_SIZE)]
+        for y in range(_PHASH_SIZE)
+    ]
+    row_coeffs = [
+        [
+            sum(
+                pixels[y][x] * _PHASH_BASIS[u][x]
+                for x in range(_PHASH_SIZE)
+            )
+            for u in range(_PHASH_LOW)
+        ]
+        for y in range(_PHASH_SIZE)
+    ]
+    coeffs = []
+    for v in range(_PHASH_LOW):
+        for u in range(_PHASH_LOW):
+            coeffs.append(
+                sum(
+                    row_coeffs[y][u] * _PHASH_BASIS[v][y]
+                    for y in range(_PHASH_SIZE)
+                )
+            )
+
+    # Exclude the DC coefficient from the median while retaining its bit,
+    # matching the common pHash construction.
+    median = statistics.median(coeffs[1:]) if len(coeffs) > 1 else 0.0
+    value = 0
+    for coefficient in coeffs:
+        value = (value << 1) | (1 if coefficient >= median else 0)
+    return value
+
+
+def frame_phashes(
+    source: str,
+    duration: float,
+    ffmpeg_path: str = "ffmpeg",
+    ratios: Iterable[float] = (0.10, 0.50, 0.90),
+    timeout: int = 45,
+) -> List[int]:
+    return [
+        frame_phash(source, duration, ratio, ffmpeg_path, timeout)
+        for ratio in ratios
+    ]
+
+
+def phash_hex(value: int) -> str:
+    return f"{int(value) & ((1 << 64) - 1):016x}"
+
+
+def phash_from_hex(value: str) -> int:
+    return int(str(value), 16)
 
 
 def hamming_distance(a: int, b: int) -> int:

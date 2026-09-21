@@ -1,57 +1,57 @@
 #!/usr/bin/env python3
-"""Booru Video Importer: exhaustive Stash-first e621 video matcher.
+"""Booru Video Importer using a persistent local e621 video catalog.
 
-Primary workflow:
-1. Select one eligible local Stash video (optionally scoped by any Stash tag/alias).
-2. Read its exact normalized duration in milliseconds.
-3. Walk the complete e621 WebM history, then MP4 history, newest to oldest.
-4. Reject every e621 post whose API-reported duration is not exactly equal before
-   opening any remote media.
-5. For exact-duration candidates, compare frames at identical relative timecodes.
-6. If a candidate fails, continue to the next exact-duration candidate.
-7. On the first strict verified match, merge authoritative e621 metadata.
-8. If both e621 video histories are exhausted, move to the next local Stash video.
+Catalog workflow:
+- Crawl e621 WebM/MP4 posts once and store post ID, URL, MD5 and duration.
+- Generate real 64-bit DCT perceptual hashes at 10%, 50% and 90% for each video.
+- Resume safely from per-format ascending cursors and retry failed hash rows.
 
-Progress and local comparison hashes are persisted so long scans can resume safely.
+Match workflow:
+- Primary Stash video MD5 first.
+- Otherwise query SQLite for exact-duration e621 rows only.
+- Compare the three cached pHashes locally and rank plausible candidates.
+- Open only plausible candidate URLs and verify one midpoint frame at the same
+  timecode before importing the authoritative e621 post metadata.
 """
 from __future__ import annotations
 
 import email.utils
 import json
 import re
+import statistics
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from e621_catalog import E621VideoCatalog, HASH_RATIOS, HASH_VERSION
 from stash_client import Stash, primary_video
-from source_index import (
-    load_cache,
-    load_scan_state,
-    save_cache,
-    save_scan_state,
-    scene_signature,
-)
+from source_index import load_cache, save_cache, scene_signature
 from video_match import (
-    DEFAULT_RATIOS,
-    early_frame_hashes,
-    early_hash_candidate,
-    frame_hashes,
+    frame_phash,
+    frame_phashes,
+    frame_timestamp_seconds,
+    hamming_distance,
+    phash_from_hex,
+    phash_hex,
     probe_duration,
-    verify_video_candidate,
 )
 
-VERSION = "2.1.0"
-USER_AGENT = f"stash-booru-video-importer/{VERSION}"
+VERSION = "3.0.0"
 E621_BASE = "https://e621.net"
 E621_PAGE_SIZE = 75
 VIDEO_EXTENSIONS = ("webm", "mp4")
-EARLY_FRAME_DISTANCE = 4
-VERIFY_FRAME_DISTANCE = 16
 STATUS_IMPORTED = "Booru Video Imported"
+
+# Three cached 64-bit pHashes already provide a strong local candidate filter.
+# Final remote verification then rechecks the midpoint frame at the same timecode.
+CATALOG_PHASH_MAX_DISTANCE = 10
+CATALOG_PHASH_MEDIAN_DISTANCE = 8.0
+FINAL_MIDPOINT_DISTANCE = 8
+HASH_RETRY_LIMIT = 3
 
 _LAST_E621_REQUEST = 0.0
 
@@ -97,6 +97,13 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def duration_milliseconds(value: Any) -> int:
+    seconds = as_float(value, 0.0)
+    if seconds <= 0:
+        return 0
+    return int(round(seconds * 1000.0))
 
 
 def _wait(last: float, interval: float) -> float:
@@ -162,7 +169,6 @@ def _e621_posts(payload: Any) -> List[Dict[str, Any]]:
 
 
 def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize both legacy and current e621 file schemas."""
     legacy = post.get("file")
     if isinstance(legacy, dict):
         return {
@@ -190,16 +196,28 @@ def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
     return {"ext": "", "url": "", "md5": "", "duration": 0.0}
 
 
+def e621_post_by_id(
+    post_id: int,
+    username: str,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    payload = e621_request(
+        f"{E621_BASE}/posts/{int(post_id)}.json",
+        username,
+        api_key,
+    )
+    posts = _e621_posts(payload)
+    return posts[0] if posts else None
+
+
 def e621_post_by_md5(
     md5: str,
     username: str,
     api_key: str,
 ) -> Optional[Dict[str, Any]]:
-    """Return an exact e621 video post for a byte-identical local file."""
     md5 = str(md5 or "").strip().casefold()
     if not md5:
         return None
-
     params = urllib.parse.urlencode(
         {
             "tags": f"md5:{md5}",
@@ -224,41 +242,24 @@ def e621_post_by_md5(
     return None
 
 
-def video_file_fingerprint(
-    video: Dict[str, Any],
-    kind: str,
-) -> Optional[str]:
-    """Read a fingerprint from the exact Stash file currently being processed."""
-    target = str(kind or "").casefold()
-    for fingerprint in video.get("fingerprints") or []:
-        if str(fingerprint.get("type") or "").casefold() == target:
-            value = str(fingerprint.get("value") or "").strip()
-            if value:
-                return value
-    return None
-
-
-def e621_video_posts_page(
+def e621_video_posts_after(
     ext: str,
     username: str,
     api_key: str,
-    before_id: Optional[int] = None,
+    after_id: int = 0,
     limit: int = E621_PAGE_SIZE,
 ) -> List[Dict[str, Any]]:
-    """Fetch one page for one video format so no interleaved history is skipped."""
+    """Enumerate one video format in ascending post-ID order."""
     ext = str(ext).casefold().lstrip(".")
     if ext not in VIDEO_EXTENSIONS:
         raise ValueError(f"Unsupported e621 video extension: {ext}")
-
-    params: Dict[str, str] = {
+    params = {
         "tags": f"type:{ext}",
         "limit": str(max(1, min(320, int(limit)))),
+        "page": f"a{max(0, int(after_id))}",
         "v2": "true",
         "mode": "extended",
     }
-    if before_id:
-        params["page"] = f"b{int(before_id)}"
-
     payload = e621_request(
         f"{E621_BASE}/posts.json?{urllib.parse.urlencode(params)}",
         username,
@@ -267,17 +268,28 @@ def e621_video_posts_page(
     rows = []
     for post in _e621_posts(payload):
         info = e621_file_info(post)
-        if info.get("ext") == ext and info.get("url"):
+        post_id = as_int(post.get("id"), 0)
+        if (
+            post_id > int(after_id)
+            and info.get("ext") == ext
+            and info.get("url")
+        ):
             rows.append(post)
-    rows.sort(key=lambda post: as_int(post.get("id"), 0), reverse=True)
+    rows.sort(key=lambda post: as_int(post.get("id"), 0))
     return rows
 
 
-def duration_milliseconds(value: Any) -> int:
-    seconds = as_float(value, 0.0)
-    if seconds <= 0:
-        return 0
-    return int(round(seconds * 1000.0))
+def video_file_fingerprint(
+    video: Dict[str, Any],
+    kind: str,
+) -> Optional[str]:
+    target = str(kind or "").casefold()
+    for fingerprint in video.get("fingerprints") or []:
+        if str(fingerprint.get("type") or "").casefold() == target:
+            value = str(fingerprint.get("value") or "").strip()
+            if value:
+                return value
+    return None
 
 
 def _date_only(value: Any) -> Optional[str]:
@@ -324,7 +336,6 @@ def e621_post_metadata(post: Dict[str, Any]) -> Dict[str, Any]:
                 if str(value).strip()
             )
 
-    # Stash has one Studio field, so preserve additional artists as tags.
     if len(artists) > 1:
         tags.extend(artists[1:])
 
@@ -379,23 +390,21 @@ def resolve_stash_tag_filter(
 def _scope(
     stash: Stash,
     settings: Dict[str, Any],
-) -> Tuple[Optional[str], str, str]:
+) -> Tuple[Optional[str], str]:
     requested = configured_stash_tag_scope(settings)
     if not requested:
-        return None, "__all__", "all eligible Stash videos"
-
+        return None, "all eligible Stash videos"
     tag_id, canonical = resolve_stash_tag_filter(stash, requested)
     if not tag_id:
         raise RuntimeError(f"Stash tag scope not found: {requested}")
-    return tag_id, f"tag:{tag_id}", canonical or requested
+    return tag_id, canonical or requested
 
 
 def eligible_local_scenes(
     stash: Stash,
     settings: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Return eligible local videos. Frame hashes are intentionally lazy."""
-    filter_tag_id, _scope_key, scope_label = _scope(stash, settings)
+    filter_tag_id, scope_label = _scope(stash, settings)
     rows: List[Dict[str, Any]] = []
     stats = {
         "scenes_seen": 0,
@@ -415,7 +424,6 @@ def eligible_local_scenes(
         )
         if not scenes:
             break
-
         for scene in scenes:
             stats["scenes_seen"] += 1
             if protected_organized_scene(scene, settings):
@@ -432,7 +440,6 @@ def eligible_local_scenes(
                 stats["no_video"] += 1
                 continue
             rows.append(scene)
-
         if page * per_page >= count:
             break
         page += 1
@@ -490,6 +497,7 @@ def apply_e621_metadata(
     performer_cache: Dict[str, Dict[str, Any]],
     studio_cache: Dict[str, Dict[str, Any]],
 ) -> None:
+    """Merge authoritative e621 metadata without overwriting existing date/studio."""
     if protected_organized_scene(scene, settings):
         log(
             "INFO",
@@ -517,9 +525,7 @@ def apply_e621_metadata(
     for name in metadata["characters"]:
         obj = performer_cache.get(name.casefold())
         if not obj:
-            obj = _ensure_entity(
-                stash, name, performer_cache, "performer"
-            )
+            obj = _ensure_entity(stash, name, performer_cache, "performer")
         if str(obj.get("id")) not in performer_ids:
             performer_ids.append(str(obj["id"]))
 
@@ -553,14 +559,13 @@ def _prepare_local_entry(
     cache: Dict[str, Any],
     ffmpeg_path: str,
 ) -> Dict[str, Any]:
-    """Load or lazily create the local comparison-frame cache."""
+    """Load/create exact duration and three local pHashes lazily."""
     scene_id = str(scene.get("id") or "")
     video = primary_video(scene)
     if not video:
         raise RuntimeError(f"Scene {scene_id} has no video file")
-
-    local_path = str(video.get("path") or "").strip()
-    if not local_path:
+    path = str(video.get("path") or "").strip()
+    if not path:
         raise RuntimeError(f"Scene {scene_id} has no local video path")
 
     signature = scene_signature(scene)
@@ -572,189 +577,330 @@ def _prepare_local_entry(
     )
 
     duration = as_float(video.get("duration"), 0.0)
-    early_hashes: List[int] = []
-    if (
-        cached
-        and str(cached.get("signature") or "") == signature
-        and isinstance(cached.get("hashes"), list)
-        and len(cached["hashes"]) >= 2
-    ):
-        duration = as_float(cached.get("duration"), duration)
-        early_hashes = [int(value) for value in cached["hashes"][:2]]
-
     if duration <= 0:
-        duration = probe_duration(local_path, ffmpeg_path, 30)
-
-    if not early_hashes:
-        early_hashes = early_frame_hashes(
-            local_path,
-            duration,
-            ffmpeg_path=ffmpeg_path,
-            timeout=45,
-        )
-        cached_scenes[scene_id] = {
-            "signature": signature,
-            "duration": round(float(duration), 3),
-            "path": local_path,
-            "hashes": [int(value) for value in early_hashes],
-        }
-
+        duration = probe_duration(path, ffmpeg_path, 30)
     duration_ms = duration_milliseconds(duration)
     if duration_ms <= 0:
         raise RuntimeError(f"Scene {scene_id} has no usable duration")
 
+    phashes: List[int] = []
+    if (
+        cached
+        and str(cached.get("signature") or "") == signature
+        and as_int(cached.get("duration_ms"), 0) == duration_ms
+        and isinstance(cached.get("phashes"), list)
+        and len(cached["phashes"]) == 3
+    ):
+        phashes = [phash_from_hex(str(value)) for value in cached["phashes"]]
+
+    if not phashes:
+        phashes = frame_phashes(
+            path,
+            duration,
+            ffmpeg_path=ffmpeg_path,
+            ratios=HASH_RATIOS,
+            timeout=45,
+        )
+        cached_scenes[scene_id] = {
+            "signature": signature,
+            "duration": round(float(duration), 6),
+            "duration_ms": duration_ms,
+            "path": path,
+            "phashes": [phash_hex(value) for value in phashes],
+        }
+
     return {
         "scene": scene,
         "scene_id": scene_id,
-        "path": local_path,
+        "path": path,
         "duration": float(duration),
         "duration_ms": duration_ms,
-        "early_hashes": early_hashes,
+        "phashes": phashes,
     }
 
 
-def _load_scope_state(
-    scope_key: str,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    state = load_scan_state()
-    scopes = state.setdefault("scopes", {})
-    if not isinstance(scopes, dict):
-        scopes = {}
-        state["scopes"] = scopes
-    scope_state = scopes.get(scope_key)
-    if not isinstance(scope_state, dict):
-        scope_state = {}
-        scopes[scope_key] = scope_state
-    scope_state.setdefault("completed_scene_ids", [])
-    return state, scope_state
-
-
-def _save_scope_state(
-    state: Dict[str, Any],
-    scope_key: str,
-    *,
-    scene_id: Optional[str],
-    ext: str,
-    before_id: Optional[int],
-    completed_scene_ids: Sequence[str],
-) -> None:
-    scopes = state.setdefault("scopes", {})
-    scopes[scope_key] = {
-        "scene_id": str(scene_id) if scene_id else None,
-        "ext": ext if ext in VIDEO_EXTENSIONS else "webm",
-        "before_id": int(before_id) if before_id else None,
-        "completed_scene_ids": sorted(
-            {str(value) for value in completed_scene_ids}
-        ),
-        "updated_at": (
-            datetime.now(timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        ),
+def _catalog_row_from_post(post: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    info = e621_file_info(post)
+    post_id = as_int(post.get("id"), 0)
+    if (
+        post_id <= 0
+        or info.get("ext") not in VIDEO_EXTENSIONS
+        or not info.get("url")
+    ):
+        return None
+    return {
+        "post_id": post_id,
+        "ext": info["ext"],
+        "duration_ms": duration_milliseconds(info.get("duration")),
+        "url": info["url"],
+        "md5": info.get("md5") or "",
+        "updated_at": str(post.get("updated_at") or ""),
     }
-    save_scan_state(state)
 
 
-def _ordered_remaining_scenes(
-    scenes: Sequence[Dict[str, Any]],
-    completed_scene_ids: Sequence[str],
-    active_scene_id: Optional[str],
-) -> List[Dict[str, Any]]:
-    completed = {str(value) for value in completed_scene_ids}
-    remaining = [
-        scene
-        for scene in scenes
-        if str(scene.get("id") or "") not in completed
-    ]
-    if active_scene_id:
-        for index, scene in enumerate(remaining):
-            if str(scene.get("id") or "") == str(active_scene_id):
-                return (
-                    [scene]
-                    + remaining[:index]
-                    + remaining[index + 1 :]
-                )
-    return remaining
+def _hash_catalog_row(
+    catalog: E621VideoCatalog,
+    row: Dict[str, Any],
+    ffmpeg_path: str,
+) -> bool:
+    post_id = as_int(row.get("post_id"), 0)
+    url = str(row.get("url") or "")
+    duration_ms = as_int(row.get("duration_ms"), 0)
+    try:
+        duration = duration_ms / 1000.0 if duration_ms > 0 else 0.0
+        if duration <= 0:
+            duration = probe_duration(url, ffmpeg_path, 60)
+            duration_ms = duration_milliseconds(duration)
+            if duration_ms <= 0:
+                raise RuntimeError("video duration unavailable")
+            catalog.set_duration(post_id, duration_ms)
+
+        hashes = frame_phashes(
+            url,
+            duration,
+            ffmpeg_path=ffmpeg_path,
+            ratios=HASH_RATIOS,
+            timeout=90,
+        )
+        timecodes_ms = [
+            int(round(frame_timestamp_seconds(duration, ratio) * 1000.0))
+            for ratio in HASH_RATIOS
+        ]
+        catalog.set_hashes(
+            post_id,
+            [phash_hex(value) for value in hashes],
+            timecodes_ms,
+            HASH_VERSION,
+        )
+        return True
+    except Exception as exc:
+        catalog.set_hash_error(post_id, str(exc))
+        log(
+            "WARNING",
+            f"e621 #{post_id}: pHash generation failed: {exc}",
+        )
+        return False
 
 
-def reset_progress(
-    stash: Stash,
-    settings: Dict[str, Any],
-) -> Dict[str, Any]:
-    _tag_id, scope_key, scope_label = _scope(stash, settings)
-    state = load_scan_state()
-    scopes = state.setdefault("scopes", {})
-    existed = scope_key in scopes
-    scopes.pop(scope_key, None)
-    save_scan_state(state)
-    log("INFO", f"Reset matching progress for '{scope_label}'")
-    return {"progress_reset": 1 if existed else 0, "scope": scope_label}
-
-
-def match_stash_against_e621(
+def build_update_catalog(
     stash: Stash,
     settings: Dict[str, Any],
     args: Dict[str, Any],
 ) -> Dict[str, int]:
-    """Run the plugin's primary Stash-first exhaustive matching workflow."""
-    dry_run = as_bool(args.get("dry_run"), False)
+    """Crawl e621 videos once and incrementally populate the persistent catalog."""
     username = str(settings.get("e621_username") or "")
     api_key = str(settings.get("e621_api_key") or "")
-    configured_pages = as_int(
-        args.get("pages_per_run"),
-        as_int(settings.get("e621_pages_per_run"), 0),
+    page_limit = max(0, as_int(args.get("page_limit"), 0))
+    hash_limit = max(0, as_int(args.get("hash_limit"), 0))
+    catalog = E621VideoCatalog()
+    ffmpeg_path = stash.ffmpeg_path()
+
+    stats = {
+        "catalog_rows_before": catalog.count(),
+        "metadata_posts_seen": 0,
+        "metadata_rows_upserted": 0,
+        "hashes_generated": 0,
+        "hash_failures": 0,
+        "provider_errors": 0,
+    }
+
+    # Retry old un-hashed rows first, so an earlier transient failure does not
+    # become permanently stranded behind the metadata cursor.
+    retry_limit = hash_limit if hash_limit > 0 else 1000000
+    for row in catalog.rows_needing_hash(
+        limit=max(1, retry_limit),
+        max_attempts=HASH_RETRY_LIMIT,
+    ):
+        if hash_limit and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit:
+            break
+        if _hash_catalog_row(catalog, row, ffmpeg_path):
+            stats["hashes_generated"] += 1
+        else:
+            stats["hash_failures"] += 1
+
+    pages_used = 0
+    for ext in VIDEO_EXTENSIONS:
+        cursor = catalog.get_cursor(ext)
+        while page_limit <= 0 or pages_used < page_limit:
+            try:
+                posts = e621_video_posts_after(
+                    ext,
+                    username,
+                    api_key,
+                    after_id=cursor,
+                    limit=E621_PAGE_SIZE,
+                )
+            except Exception as exc:
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"e621 {ext} catalog crawl failed after #{cursor}: {exc}",
+                )
+                break
+
+            if not posts:
+                catalog.set_up_to_date(ext, True)
+                break
+
+            pages_used += 1
+            rows = []
+            for post in posts:
+                stats["metadata_posts_seen"] += 1
+                row = _catalog_row_from_post(post)
+                if row:
+                    rows.append(row)
+            upserted = catalog.upsert_videos(rows)
+            stats["metadata_rows_upserted"] += as_int(upserted, 0)
+
+            last_id = max(
+                (as_int(post.get("id"), 0) for post in posts),
+                default=cursor,
+            )
+            if last_id <= cursor:
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"e621 {ext} catalog crawl did not advance beyond #{cursor}",
+                )
+                break
+
+            cursor = last_id
+            catalog.set_cursor(ext, cursor)
+            catalog.set_up_to_date(ext, False)
+            log(
+                "INFO",
+                f"Catalog {ext}: indexed metadata through e621 #{cursor}; "
+                f"{catalog.count()} total video rows",
+            )
+
+            # Hash newly discovered rows immediately. This remains resumable:
+            # metadata is already committed and rows with failures stay pending.
+            pending = catalog.rows_needing_hash(
+                limit=1000000 if hash_limit <= 0 else max(1, hash_limit),
+                max_attempts=HASH_RETRY_LIMIT,
+            )
+            for row in pending:
+                if (
+                    hash_limit
+                    and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit
+                ):
+                    break
+                if _hash_catalog_row(catalog, row, ffmpeg_path):
+                    stats["hashes_generated"] += 1
+                else:
+                    stats["hash_failures"] += 1
+
+            if hash_limit and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit:
+                break
+
+        if page_limit > 0 and pages_used >= page_limit:
+            break
+        if hash_limit and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit:
+            break
+
+    stats["catalog_rows_after"] = catalog.count()
+    stats["catalog_hashed"] = catalog.hashed_count()
+    stats["catalog_hash_failed"] = catalog.failed_count()
+    stats["duration_buckets"] = catalog.duration_bucket_count()
+    log("INFO", f"e621 video catalog update finished: {stats}")
+    return stats
+
+
+def catalog_candidate_score(
+    local_hashes: Sequence[int],
+    row: Dict[str, Any],
+) -> Optional[Tuple[float, int, List[int]]]:
+    try:
+        remote = [
+            phash_from_hex(str(row["phash_10"])),
+            phash_from_hex(str(row["phash_50"])),
+            phash_from_hex(str(row["phash_90"])),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(local_hashes) != 3:
+        return None
+
+    distances = [
+        hamming_distance(local_hashes[index], remote[index])
+        for index in range(3)
+    ]
+    median = float(statistics.median(distances))
+    maximum = max(distances)
+    if median > CATALOG_PHASH_MEDIAN_DISTANCE:
+        return None
+    if maximum > CATALOG_PHASH_MAX_DISTANCE:
+        return None
+    return median, maximum, distances
+
+
+def _apply_matched_post(
+    stash: Stash,
+    scene: Dict[str, Any],
+    post: Dict[str, Any],
+    settings: Dict[str, Any],
+    tag_cache: Dict[str, Dict[str, Any]],
+    performer_cache: Dict[str, Dict[str, Any]],
+    studio_cache: Dict[str, Dict[str, Any]],
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        return
+    apply_e621_metadata(
+        stash,
+        scene,
+        post,
+        settings,
+        tag_cache,
+        performer_cache,
+        studio_cache,
     )
-    # 0 or blank means continuous scanning for the active local video until a
-    # verified match is found or both e621 WebM and MP4 histories are exhausted.
-    continuous_scan = configured_pages <= 0
-    pages_per_run = 0 if continuous_scan else max(1, configured_pages)
+
+
+def match_stash_against_catalog(
+    stash: Stash,
+    settings: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, int]:
+    dry_run = as_bool(args.get("dry_run"), False)
     local_limit = max(0, as_int(args.get("local_limit"), 0))
+    username = str(settings.get("e621_username") or "")
+    api_key = str(settings.get("e621_api_key") or "")
 
     scenes, local_stats = eligible_local_scenes(stash, settings)
-    _tag_id, scope_key, scope_label = _scope(stash, settings)
-    state, scope_state = _load_scope_state(scope_key)
-
-    completed_scene_ids = [
-        str(value)
-        for value in scope_state.get("completed_scene_ids") or []
-    ]
-    active_scene_id = str(scope_state.get("scene_id") or "") or None
-    active_ext = str(scope_state.get("ext") or "webm").casefold()
-    if active_ext not in VIDEO_EXTENSIONS:
-        active_ext = "webm"
-    active_before_id = as_int(scope_state.get("before_id"), 0) or None
-
-    remaining = _ordered_remaining_scenes(
-        scenes,
-        completed_scene_ids,
-        active_scene_id,
-    )
     if local_limit:
-        remaining = remaining[:local_limit]
+        scenes = scenes[:local_limit]
+
+    catalog = E621VideoCatalog()
+    catalog_rows = catalog.count()
+    catalog_hashed = catalog.hashed_count()
 
     stats = {
         "eligible_local_videos": local_stats["eligible"],
         "organized_protected": local_stats["organized_protected"],
+        "catalog_rows": catalog_rows,
+        "catalog_hashed": catalog_hashed,
         "local_videos_started": 0,
         "local_videos_matched": 0,
-        "local_videos_exhausted": 0,
-        "md5_checked": 0,
-        "md5_exact_matches": 0,
-        "md5_unavailable": 0,
-        "md5_lookup_errors": 0,
-        "e621_posts_seen": 0,
-        "duration_filtered": 0,
-        "duration_unknown": 0,
-        "exact_duration_candidates": 0,
-        "frame_rejected": 0,
-        "verified_rejected": 0,
+        "md5_catalog_matches": 0,
+        "md5_api_matches": 0,
+        "duration_candidates": 0,
+        "phash_candidates": 0,
+        "midpoint_verified": 0,
+        "unmatched": 0,
         "provider_errors": 0,
     }
 
-    if not remaining:
-        log("INFO", f"No remaining eligible local videos for '{scope_label}'")
+    if not scenes:
+        log("INFO", "No eligible local videos to match")
         return stats
+
+    if catalog_rows == 0:
+        log(
+            "WARNING",
+            "e621 video catalog is empty. Run 'Build / Update e621 Video Catalog' "
+            "before pHash matching. Direct MD5 lookups will still be attempted.",
+        )
 
     ffmpeg_path = stash.ffmpeg_path()
     local_cache = load_cache()
@@ -762,381 +908,186 @@ def match_stash_against_e621(
     performer_cache = stash.all_performers()
     studio_cache = stash.all_studios()
 
-    for scene in remaining:
+    for scene in scenes:
         scene_id = str(scene.get("id") or "")
-        resume_this_scene = scene_id == active_scene_id
-        current_ext = active_ext if resume_this_scene else "webm"
-        before_id = active_before_id if resume_this_scene else None
-
         stats["local_videos_started"] += 1
+        video = primary_video(scene) or {}
+        local_md5 = video_file_fingerprint(video, "md5")
 
-        video = primary_video(scene)
-        local_md5 = video_file_fingerprint(video or {}, "md5")
+        # Fastest path: exact byte-identical file from the local catalog.
+        post: Optional[Dict[str, Any]] = None
         if local_md5:
-            stats["md5_checked"] += 1
-            try:
-                exact_post = e621_post_by_md5(
-                    local_md5,
-                    username,
-                    api_key,
-                )
-            except Exception as exc:
-                exact_post = None
-                stats["md5_lookup_errors"] += 1
-                stats["provider_errors"] += 1
-                log(
-                    "WARNING",
-                    f"Scene {scene_id}: direct e621 MD5 lookup failed: {exc}; "
-                    "falling back to duration/frame search",
-                )
-
-            if exact_post is not None:
-                post_id = as_int(exact_post.get("id"), 0)
-                stats["md5_exact_matches"] += 1
-                stats["local_videos_matched"] += 1
-                if dry_run:
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: exact file MD5 matched e621 "
-                        f"#{post_id} (preview only; no changes)",
+            cached_md5 = catalog.find_md5(local_md5)
+            if cached_md5:
+                try:
+                    post = e621_post_by_id(
+                        as_int(cached_md5.get("post_id"), 0),
+                        username,
+                        api_key,
                     )
-                    break
+                except Exception as exc:
+                    stats["provider_errors"] += 1
+                    log(
+                        "WARNING",
+                        f"Scene {scene_id}: cached MD5 post fetch failed: {exc}",
+                    )
+                if post:
+                    stats["md5_catalog_matches"] += 1
 
-                apply_e621_metadata(
-                    stash,
-                    scene,
-                    exact_post,
-                    settings,
-                    tag_cache,
-                    performer_cache,
-                    studio_cache,
-                )
-                completed_scene_ids.append(scene_id)
-                _save_scope_state(
-                    state,
-                    scope_key,
-                    scene_id=None,
-                    ext="webm",
-                    before_id=None,
-                    completed_scene_ids=completed_scene_ids,
-                )
-                log(
-                    "INFO",
-                    f"Scene {scene_id}: exact file MD5 matched e621 "
-                    f"#{post_id}; metadata attached without history scan",
-                )
-                active_scene_id = None
-                active_ext = "webm"
-                active_before_id = None
-                continue
-        else:
-            stats["md5_unavailable"] += 1
+            # The catalog may not yet include today's newest post, so retain a
+            # direct MD5 lookup as a zero-ambiguity safety path.
+            if post is None:
+                try:
+                    post = e621_post_by_md5(local_md5, username, api_key)
+                except Exception as exc:
+                    stats["provider_errors"] += 1
+                    log(
+                        "WARNING",
+                        f"Scene {scene_id}: direct e621 MD5 lookup failed: {exc}",
+                    )
+                if post:
+                    stats["md5_api_matches"] += 1
+
+        if post is not None:
+            stats["local_videos_matched"] += 1
             log(
                 "INFO",
-                f"Scene {scene_id}: no MD5 fingerprint on primary video file; "
-                "using duration/frame search",
+                f"Scene {scene_id}: exact MD5 match e621 #{post.get('id')}",
             )
-
-        try:
-            entry = _prepare_local_entry(
+            _apply_matched_post(
+                stash,
                 scene,
-                local_cache,
-                ffmpeg_path,
+                post,
+                settings,
+                tag_cache,
+                performer_cache,
+                studio_cache,
+                dry_run,
             )
+            if dry_run:
+                break
+            continue
+
+        # pHash path.
+        try:
+            entry = _prepare_local_entry(scene, local_cache, ffmpeg_path)
             if not dry_run:
                 save_cache(local_cache)
         except Exception as exc:
             stats["provider_errors"] += 1
-            log("WARNING", f"Scene {scene_id}: local preparation failed: {exc}")
-            break
+            log("WARNING", f"Scene {scene_id}: local pHash preparation failed: {exc}")
+            if dry_run:
+                break
+            continue
 
-        log(
-            "INFO",
-            f"Scene {scene_id}: searching all e621 video history for exact "
-            f"duration {entry['duration_ms']} ms; starting {current_ext} "
-            f"at {before_id or 'newest'}",
+        rows = catalog.candidates_for_duration(
+            entry["duration_ms"],
+            require_hashes=True,
         )
+        stats["duration_candidates"] += len(rows)
 
-        local_full_hashes: Optional[List[int]] = None
+        ranked = []
+        for row in rows:
+            score = catalog_candidate_score(entry["phashes"], row)
+            if score is None:
+                continue
+            ranked.append((score[0], score[1], as_int(row.get("post_id"), 0), row, score[2]))
+
+        ranked.sort(key=lambda item: (item[0], item[1], -item[2]))
+        stats["phash_candidates"] += len(ranked)
+
         matched = False
-        exhausted_scene = False
-        pages_used = 0
-
-        while (
-            (continuous_scan or pages_used < pages_per_run)
-            and not matched
-            and not exhausted_scene
-        ):
+        for median, maximum, post_id, row, distances in ranked:
+            url = str(row.get("url") or "")
+            if not url:
+                continue
             try:
-                posts = e621_video_posts_page(
-                    current_ext,
-                    username,
-                    api_key,
-                    before_id=before_id,
-                    limit=E621_PAGE_SIZE,
+                remote_midpoint = frame_phash(
+                    url,
+                    entry["duration"],
+                    HASH_RATIOS[1],
+                    ffmpeg_path=ffmpeg_path,
+                    timeout=90,
+                )
+                midpoint_distance = hamming_distance(
+                    entry["phashes"][1],
+                    remote_midpoint,
                 )
             except Exception as exc:
                 stats["provider_errors"] += 1
                 log(
                     "WARNING",
-                    f"Scene {scene_id}: e621 {current_ext} history request "
+                    f"Scene {scene_id}: e621 #{post_id} midpoint verification "
                     f"failed: {exc}",
                 )
-                break
+                continue
 
-            if not posts:
-                if current_ext == "webm":
-                    current_ext = "mp4"
-                    before_id = None
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: WebM history exhausted; "
-                        "continuing with MP4 from newest",
-                    )
-                    if not dry_run:
-                        _save_scope_state(
-                            state,
-                            scope_key,
-                            scene_id=scene_id,
-                            ext=current_ext,
-                            before_id=None,
-                            completed_scene_ids=completed_scene_ids,
-                        )
-                    continue
-
-                exhausted_scene = True
-                break
-
-            pages_used += 1
-            last_post_id: Optional[int] = None
-
-            for post in posts:
-                post_id = as_int(post.get("id"), 0)
-                if post_id > 0:
-                    last_post_id = post_id
-                stats["e621_posts_seen"] += 1
-
-                info = e621_file_info(post)
-                remote_duration_ms = duration_milliseconds(
-                    info.get("duration")
-                )
-
-                # Mandatory first gate: do not open remote video data unless
-                # duration is known and exactly equal to the active local file.
-                if remote_duration_ms <= 0:
-                    stats["duration_unknown"] += 1
-                    continue
-                if remote_duration_ms != entry["duration_ms"]:
-                    stats["duration_filtered"] += 1
-                    continue
-
-                remote_url = str(info.get("url") or "").strip()
-                if not remote_url:
-                    continue
-
-                stats["exact_duration_candidates"] += 1
+            if midpoint_distance > FINAL_MIDPOINT_DISTANCE:
                 log(
                     "INFO",
-                    f"Scene {scene_id}: e621 #{post_id} has exact duration "
-                    f"{remote_duration_ms} ms; comparing same-timecode frames",
+                    f"Scene {scene_id}: e621 #{post_id} cached pHash candidate "
+                    f"rejected by live midpoint frame (distance {midpoint_distance})",
                 )
+                continue
 
-                try:
-                    remote_early = early_frame_hashes(
-                        remote_url,
-                        float(info["duration"]),
-                        ffmpeg_path=ffmpeg_path,
-                        timeout=60,
-                    )
-                except Exception as exc:
-                    stats["provider_errors"] += 1
-                    log(
-                        "WARNING",
-                        f"Scene {scene_id}: e621 #{post_id} frame extraction "
-                        f"failed: {exc}; checking next exact-duration file",
-                    )
-                    continue
-
-                early = early_hash_candidate(
-                    entry["early_hashes"],
-                    remote_early,
-                    max_distance=EARLY_FRAME_DISTANCE,
-                )
-                if not early.get("candidate"):
-                    stats["frame_rejected"] += 1
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: e621 #{post_id} duration matched "
-                        f"but same-timecode frames did not; checking next file",
-                    )
-                    continue
-
-                try:
-                    if local_full_hashes is None:
-                        local_full_hashes = frame_hashes(
-                            entry["path"],
-                            entry["duration"],
-                            ffmpeg_path=ffmpeg_path,
-                            ratios=DEFAULT_RATIOS,
-                            timeout=45,
-                        )
-                    remote_full_hashes = frame_hashes(
-                        remote_url,
-                        float(info["duration"]),
-                        ffmpeg_path=ffmpeg_path,
-                        ratios=DEFAULT_RATIOS,
-                        timeout=60,
-                    )
-                    verification = verify_video_candidate(
-                        entry["path"],
-                        remote_url,
-                        ffmpeg_path=ffmpeg_path,
-                        ratios=DEFAULT_RATIOS,
-                        frame_distance=VERIFY_FRAME_DISTANCE,
-                        timeout=60,
-                        local_duration=entry["duration"],
-                        local_hashes=local_full_hashes,
-                        remote_duration=float(info["duration"]),
-                        remote_hashes=remote_full_hashes,
-                        strict=True,
-                    )
-                except Exception as exc:
-                    stats["provider_errors"] += 1
-                    log(
-                        "WARNING",
-                        f"Scene {scene_id}: e621 #{post_id} verification "
-                        f"failed: {exc}; checking next exact-duration file",
-                    )
-                    continue
-
-                if not verification.get("high"):
-                    stats["verified_rejected"] += 1
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: e621 #{post_id} rejected after "
-                        f"{verification.get('matched_frames')}/"
-                        f"{verification.get('total_frames')} aligned frames; "
-                        "checking next exact-duration file",
-                    )
-                    continue
-
-                matched = True
-                stats["local_videos_matched"] += 1
-                if dry_run:
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: VERIFIED e621 #{post_id} "
-                        "(preview only; no changes)",
-                    )
-                else:
-                    apply_e621_metadata(
-                        stash,
-                        scene,
-                        post,
-                        settings,
-                        tag_cache,
-                        performer_cache,
-                        studio_cache,
-                    )
-                    completed_scene_ids.append(scene_id)
-                    _save_scope_state(
-                        state,
-                        scope_key,
-                        scene_id=None,
-                        ext="webm",
-                        before_id=None,
-                        completed_scene_ids=completed_scene_ids,
-                    )
-                    log(
-                        "INFO",
-                        f"Scene {scene_id}: MATCH e621 #{post_id}; "
-                        "all authoritative metadata attached",
-                    )
-                break
-
-            if matched:
-                break
-
-            if last_post_id:
-                before_id = last_post_id
-                if not dry_run:
-                    _save_scope_state(
-                        state,
-                        scope_key,
-                        scene_id=scene_id,
-                        ext=current_ext,
-                        before_id=before_id,
-                        completed_scene_ids=completed_scene_ids,
-                    )
-            else:
-                # A non-empty page should have IDs, but do not risk looping.
+            try:
+                post = e621_post_by_id(post_id, username, api_key)
+            except Exception as exc:
                 stats["provider_errors"] += 1
                 log(
                     "WARNING",
-                    f"Scene {scene_id}: e621 page contained no usable post IDs; "
-                    "stopping without advancing progress",
+                    f"Scene {scene_id}: e621 #{post_id} metadata fetch failed: {exc}",
                 )
-                break
+                continue
+            if not post:
+                continue
 
-        if dry_run:
-            # Preview intentionally examines one local file and never saves state.
+            matched = True
+            stats["midpoint_verified"] += 1
+            stats["local_videos_matched"] += 1
+            log(
+                "INFO",
+                f"Scene {scene_id}: MATCH e621 #{post_id}; exact duration, "
+                f"cached pHash distances {distances}, live midpoint "
+                f"distance {midpoint_distance}",
+            )
+            _apply_matched_post(
+                stash,
+                scene,
+                post,
+                settings,
+                tag_cache,
+                performer_cache,
+                studio_cache,
+                dry_run,
+            )
             break
 
-        if matched:
-            active_scene_id = None
-            active_ext = "webm"
-            active_before_id = None
-            continue
-
-        if exhausted_scene:
-            stats["local_videos_exhausted"] += 1
-            completed_scene_ids.append(scene_id)
-            _save_scope_state(
-                state,
-                scope_key,
-                scene_id=None,
-                ext="webm",
-                before_id=None,
-                completed_scene_ids=completed_scene_ids,
-            )
+        if not matched:
+            stats["unmatched"] += 1
             log(
                 "INFO",
-                f"Scene {scene_id}: no verified match after complete e621 "
-                "WebM + MP4 history; moving to next local Stash video",
+                f"Scene {scene_id}: no verified catalog match for exact duration "
+                f"{entry['duration_ms']} ms",
             )
-            active_scene_id = None
-            active_ext = "webm"
-            active_before_id = None
-            continue
 
-        # If we are here, the scene did not match and did not exhaust history.
-        # Either a finite page budget was reached or a provider/runtime issue
-        # interrupted a continuous scan. Persist a safe resume cursor.
-        _save_scope_state(
-            state,
-            scope_key,
-            scene_id=scene_id,
-            ext=current_ext,
-            before_id=before_id,
-            completed_scene_ids=completed_scene_ids,
-        )
-        if continuous_scan:
-            log(
-                "INFO",
-                f"Scene {scene_id}: continuous scan stopped before history "
-                f"was exhausted; next run resumes this same file in "
-                f"{current_ext} at {before_id or 'newest'}",
-            )
-        else:
-            log(
-                "INFO",
-                f"Scene {scene_id}: configured page budget reached; next run "
-                f"resumes this same file in {current_ext} at "
-                f"{before_id or 'newest'}",
-            )
-        break
+        if dry_run:
+            break
 
+    log("INFO", f"Catalog match finished: {stats}")
     return stats
+
+
+def catalog_status() -> Dict[str, int]:
+    catalog = E621VideoCatalog()
+    return {
+        "catalog_rows": catalog.count(),
+        "catalog_hashed": catalog.hashed_count(),
+        "catalog_hash_failed": catalog.failed_count(),
+        "duration_buckets": catalog.duration_bucket_count(),
+        "webm_cursor": catalog.get_cursor("webm"),
+        "mp4_cursor": catalog.get_cursor("mp4"),
+    }
 
 
 def main() -> None:
@@ -1146,10 +1097,13 @@ def main() -> None:
     args = payload.get("args") or {}
     mode = str(args.get("mode") or "match")
 
-    if mode == "match":
-        stats = match_stash_against_e621(stash, settings, args)
-    elif mode == "reset":
-        stats = reset_progress(stash, settings)
+    if mode == "catalog":
+        stats = build_update_catalog(stash, settings, args)
+    elif mode == "catalog_status":
+        stats = catalog_status()
+        log("INFO", f"e621 video catalog status: {stats}")
+    elif mode == "match":
+        stats = match_stash_against_catalog(stash, settings, args)
     else:
         raise RuntimeError(f"Unsupported mode: {mode}")
 

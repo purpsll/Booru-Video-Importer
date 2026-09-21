@@ -1,114 +1,74 @@
 # Booru Video Importer
 
-A focused Stash video importer that matches local videos against **e621 video history**.
+The plugin maintains one persistent **SQLite e621 video catalog** and reuses it for every Stash video.
 
-## Exact-file MD5 first
+## Database location
 
-Before any duration crawl or frame extraction, the importer reads the MD5 fingerprint from the exact primary Stash video file and asks e621 directly for that MD5.
+No manual database setup is required. The plugin creates SQLite automatically in:
 
-A returned e621 video with the identical MD5 is a byte-for-byte file match, so metadata is imported immediately. If there is no MD5 fingerprint, the lookup fails, or e621 has no exact-file match, the same task automatically continues with the exhaustive duration/frame workflow.
+`<Stash config directory>/booru-video-importer/e621_video_catalog.sqlite`
 
-## Primary workflow
+On a typical Linux/Docker Stash install this is commonly:
 
-The importer processes one eligible Stash video at a time:
+`/root/.stash/booru-video-importer/e621_video_catalog.sqlite`
 
-1. Check the primary local video's MD5 directly against e621.
-2. If the MD5 matches an e621 video, import immediately and move to the next local file.
-3. If MD5 does not match, get the local video's duration and normalize it to integer milliseconds.
-4. Walk e621 WebM video history from newest to oldest.
-5. Skip posts with missing duration.
-6. Skip every video whose duration is not exactly equal to the local duration.
-7. For each exact-duration candidate, extract frames from the local and remote videos at the same timecodes.
-8. If the frames do not match, continue to the next exact-duration e621 video.
-9. If the candidate passes strict aligned verification, import all supported e621 metadata and stop searching for that local file.
-10. If WebM history is exhausted, repeat through MP4 history.
-11. If both histories are exhausted with no verified match, move to the next local Stash video and begin again from newest.
+The local Stash pHash cache is stored in the same persistent folder.
 
-## Why exact duration is first
+These files are outside the plugin install directory so a plugin update does not erase them.
 
-Remote e621 video data is not opened until the API-reported duration exactly matches the local Stash duration after millisecond normalization.
+## Build / Update e621 Video Catalog
 
-Examples:
+Run this task before expecting complete pHash matching coverage.
 
-- local `60.000 s`, e621 `60.000 s` → candidate may be frame-scanned;
-- local `60.000 s`, e621 `59.999 s` → skipped;
-- local `60.000 s`, e621 `60.001 s` → skipped;
-- missing e621 duration → skipped.
+The first historical build:
 
-## Local frame cache
+- walks e621 WebM and MP4 posts once;
+- stores post ID, URL, MD5 and exact duration;
+- records deterministic 10%, 50%, and 90% frame timecodes;
+- generates three real 64-bit DCT perceptual hashes;
+- saves per-format ascending e621 cursors;
+- retries transient frame/hash failures up to a bounded number of attempts.
 
-The plugin maintains an internal lazy frame-hash cache for Stash videos.
+The task is resumable. Later runs only add newer e621 posts plus retry pending failures.
 
-There is no manual index task. The cache is created only when a local video is actually processed, and unchanged files reuse cached hashes.
+A partially built catalog can already be used for matching, but only indexed/hashed rows are available to the pHash matcher.
 
-## Continuous scanning
+## Main matching workflow
 
-The main matching task defaults to continuous mode. There is no plugin-level maximum page count in continuous mode.
+For each filtered Stash video:
 
-## Saved progress
-
-A complete e621-history search may span multiple plugin runs.
-
-The plugin saves:
-
-- active Stash scene;
-- active e621 format (WebM or MP4);
-- current e621 history cursor;
-- completed local scene IDs.
-
-The next run resumes the same local video until it either matches or exhausts both e621 histories.
-
-Each Stash Tag Scope has independent progress.
-
-## Stash Tag Scope
-
-**Stash Tag Scope (any tag or alias)** accepts any live Stash tag name or alias.
-
-For example, `furry` restricts the importer to local video scenes already carrying that tag.
-
-Leave it blank to process all eligible local videos.
-
-## Organized protection
-
-When **Protect Organized Scenes** is enabled, Organized scenes are ignored completely.
+1. MD5 lookup first.
+2. If MD5 does not match, use exact duration to query SQLite.
+3. Compare local 10/50/90 pHashes against only that exact-duration bucket.
+4. Discard non-close candidates locally.
+5. Pull only plausible candidate URLs.
+6. Verify one live 50% frame at the identical timecode.
+7. Fetch the real e621 post and import metadata after verification.
 
 ## Imported metadata
 
-For a strict verified e621 match the plugin merges:
+Verified matches merge:
 
-- e621 canonical post URL;
-- source URLs;
-- post date if the Stash scene date is blank;
-- general/species/copyright/lore tags;
-- character tags as Performers;
+- e621 post URL and source URLs;
+- tags;
+- characters as Performers;
 - first artist as Studio when Studio is blank;
 - additional artists as tags;
-- `Booru Video Imported` marker.
+- e621 post date when date is blank;
+- `Booru Video Imported`.
+
+Existing Details text remains unchanged.
 
 ## Tasks
 
-### Preview Next Stash Video Match (No Changes)
+**1. Build / Update e621 Video Catalog** — initial historical build and future incremental updates.
 
-Checks one local video against a small e621 history window without changing Stash or saved progress.
+**2. Show e621 Video Catalog Status** — inspect row/hash/cursor status.
 
-### Match Filtered Stash Videos Against e621
+**3. Preview Next Stash Video Match (No Changes)** — test one local video.
 
-Main task. Repeated runs continue the current local video until a match is found or e621 video history is exhausted.
+**4. Match Filtered Stash Videos Against e621 Catalog** — main importer.
 
-### Reset Matching Progress
+## Removed legacy workflow
 
-Resets the current Stash Tag Scope to the first eligible local video and newest e621 history.
-
-## Removed legacy workflows
-
-The rebuilt importer no longer includes:
-
-- the old separate Fast MD5 task (MD5 is now an internal first-stage optimization);
-- Deep Reverse Search;
-- SauceNAO;
-- e621 ERIS reverse-image search;
-- Rule34 matching;
-- Review/No-Match/Retry queues;
-- manual local frame-index building.
-
-Those workflows are unnecessary for the new Stash-first exhaustive e621 matcher.
+The plugin no longer performs a complete e621 history crawl separately for every Stash video. The catalog exists specifically to eliminate that repeated work.
