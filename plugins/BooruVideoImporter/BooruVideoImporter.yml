@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Separate scene/video reverse-search plugin for e621 and Rule34. Uses exact video MD5 first, SauceNAO-first frame discovery with a circuit-broken e621 ERIS fallback, verifies candidate videos across multiple perceptual frame hashes, and imports authoritative metadata only after video verification.
-version: 1.0.1
+description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and e621 source-first matching that compares early video frames against a cached local Stash frame index before full multi-frame verification.
+version: 1.1.0
 
 exec:
   - python
@@ -10,6 +10,16 @@ interface: raw
 errLog: info
 
 settings:
+  skip_organized_scenes:
+    displayName: Protect Organized Scenes
+    description: When enabled, any Stash scene already marked Organized is skipped completely. The plugin will not add tags, performers, studio, URLs, dates, or workflow markers to that scene.
+    type: BOOLEAN
+
+  e621_source_pages:
+    displayName: e621 Source-First Pages per Run
+    description: Number of e621 pages to inspect during source-first matching. Each page checks up to 75 WebM and 75 MP4 posts. Leave 0 or blank to use 5 pages.
+    type: NUMBER
+
   e621_username:
     displayName: e621 username
     description: Recommended. Enables authenticated e621 API requests and ERIS frame discovery.
@@ -78,3 +88,24 @@ tasks:
       lookup_mode: deep
       dry_run: false
       only_no_match: true
+
+  - name: 6. Build / Refresh Local Video Frame Index
+    description: Builds a cached early-frame hash index for eligible Stash scenes. Unchanged files reuse cached hashes on later runs. Organized scenes are excluded when Protect Organized Scenes is enabled.
+    defaultArgs:
+      mode: build_source_index
+      force_index: false
+
+  - name: 7. Preview e621 Source-First Match (25 Posts, No Changes)
+    description: Checks up to 25 recent e621 WebM/MP4 posts against the local frame index. Early-frame similarity only nominates candidates; full multi-frame verification is still required. Makes no Stash metadata changes.
+    defaultArgs:
+      mode: source_first_e621
+      dry_run: true
+      source_pages: 1
+      source_post_limit: 25
+
+  - name: 8. Match e621 Videos to Local Stash
+    description: Scans recent e621 WebM/MP4 posts outward, compares early frames against the cached local Stash index, verifies candidate videos across multiple frames, and imports authoritative e621 metadata only for verified matches.
+    defaultArgs:
+      mode: source_first_e621
+      dry_run: false
+
