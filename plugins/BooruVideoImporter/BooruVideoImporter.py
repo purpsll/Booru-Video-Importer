@@ -39,7 +39,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -1095,6 +1095,28 @@ def _duration_delta(local_duration: float, remote_duration: float) -> float:
     return abs(local_duration - remote_duration) / max(local_duration, remote_duration)
 
 
+def source_first_duration_candidates(
+    local_index: Sequence[Dict[str, Any]],
+    remote_duration: float,
+    tolerance_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Filter local scenes by e621-reported duration before any remote frame work."""
+    remote_duration = max(0.0, float(remote_duration))
+    tolerance_seconds = max(0.0, float(tolerance_seconds))
+    if remote_duration <= 0:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for entry in local_index:
+        local_duration = as_float(entry.get("duration"), 0.0)
+        if local_duration <= 0:
+            continue
+        difference = abs(local_duration - remote_duration)
+        if difference <= tolerance_seconds:
+            rows.append(entry)
+    return rows
+
+
 def source_first_local_candidates(
     local_index: Sequence[Dict[str, Any]],
     remote_hashes: Sequence[int],
@@ -1145,6 +1167,10 @@ def source_first_e621(
     force_index = as_bool(args.get("force_index"), False)
     post_limit = max(0, as_int(args.get("source_post_limit"), 0))
     configured_pages = as_int(settings.get("e621_source_pages"), 5)
+    duration_tolerance = max(
+        0.0,
+        as_float(settings.get("source_first_duration_tolerance_seconds"), 2.0),
+    )
     source_pages = max(
         1,
         min(100, as_int(args.get("source_pages"), configured_pages or 5)),
@@ -1166,6 +1192,8 @@ def source_first_e621(
     stats = {
         "posts_seen": 0,
         "video_posts": 0,
+        "duration_candidates": 0,
+        "duration_filtered_posts": 0,
         "early_candidates": 0,
         "verified_matches": 0,
         "high_confidence_review": 0,
@@ -1216,6 +1244,33 @@ def source_first_e621(
             try:
                 if remote_duration <= 0:
                     remote_duration = probe_duration(remote_url, ffmpeg_path, 45)
+            except Exception as exc:
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"e621 post {post.get('id')}: duration lookup failed: {exc}",
+                )
+                continue
+
+            duration_pool = source_first_duration_candidates(
+                local_index,
+                remote_duration,
+                duration_tolerance,
+            )
+            if not duration_pool:
+                stats["duration_filtered_posts"] += 1
+                log(
+                    "INFO",
+                    f"e621 #{post.get('id')}: no local scenes within "
+                    f"{duration_tolerance:.2f}s of {remote_duration:.2f}s; "
+                    "skipping frame comparison",
+                )
+                if post_limit:
+                    progress(stats["posts_seen"] / max(1, post_limit))
+                continue
+
+            stats["duration_candidates"] += len(duration_pool)
+            try:
                 remote_early = early_frame_hashes(
                     remote_url,
                     remote_duration,
@@ -1231,7 +1286,7 @@ def source_first_e621(
                 continue
 
             candidates = source_first_local_candidates(
-                local_index,
+                duration_pool,
                 remote_early,
                 remote_duration,
             )
