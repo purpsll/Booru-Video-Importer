@@ -299,5 +299,19 @@ class VideoMatchTests(unittest.TestCase):
         self.assertFalse(result["candidate"])
 
 
+    def test_source_first_rejects_large_duration_mismatch(self):
+        local_index = [{
+            "scene_id": "1",
+            "duration": 100.0,
+            "hashes": [0x0000, 0x000F],
+        }]
+        rows = plugin.source_first_local_candidates(
+            local_index,
+            [0x0001, 0x000E],
+            60.0,
+        )
+        self.assertEqual(rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()
