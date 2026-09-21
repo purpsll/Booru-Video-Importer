@@ -481,5 +481,57 @@ class BooruVideoImporterTests(unittest.TestCase):
         self.assertIn("Invalid data found when processing input", message)
 
 
+    def test_failed_phash_row_is_attempted_only_once_per_catalog_run(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        row = {
+            "post_id": 555,
+            "ext": "webm",
+            "duration_ms": 60000,
+            "url": "https://example/555.webm",
+            "hash_attempts": 0,
+        }
+        post = {
+            "id": 600,
+            "updated_at": "2026-09-21T00:00:00Z",
+            "file": {
+                "ext": "webm",
+                "url": "https://example/600.webm",
+                "md5": "abc",
+                "duration": 60.0,
+            },
+        }
+
+        fake_catalog = mock.Mock()
+        fake_catalog.count.side_effect = [1, 2, 2]
+        fake_catalog.hashed_count.return_value = 0
+        fake_catalog.failed_count.return_value = 1
+        fake_catalog.duration_bucket_count.return_value = 1
+        fake_catalog.get_cursor.side_effect = lambda ext: 500 if ext == "webm" else 0
+        fake_catalog.upsert_videos.return_value = 1
+        fake_catalog.rows_needing_hash.side_effect = [
+            [row],
+            [row],
+        ]
+
+        with mock.patch.object(
+            plugin, "E621VideoCatalog", return_value=fake_catalog
+        ), mock.patch.object(
+            plugin,
+            "e621_video_posts_after",
+            side_effect=[[post]],
+        ), mock.patch.object(
+            plugin, "_hash_catalog_row", return_value=False
+        ) as hash_row:
+            stats = plugin.build_update_catalog(
+                stash,
+                {},
+                {"page_limit": 1, "hash_limit": 0},
+            )
+
+        hash_row.assert_called_once_with(fake_catalog, row, "ffmpeg")
+        self.assertEqual(stats["hash_failures"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

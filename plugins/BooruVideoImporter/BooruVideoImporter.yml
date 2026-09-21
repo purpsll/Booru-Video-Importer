@@ -1,6 +1,6 @@
 name: Booru Video Importer
 description: Matches Stash videos against a persistent local SQLite catalog of e621 WebM/MP4 metadata, exact durations, MD5s, sampled timecodes, and perceptual frame hashes. Exact MD5 matches import immediately; other matches use exact duration, local pHash comparison, and one live same-timecode midpoint verification.
-version: 3.0.1
+version: 3.0.2
 
 exec:
   - python
@@ -32,7 +32,7 @@ settings:
 
 tasks:
   - name: 1. Build / Update e621 Video Catalog
-    description: Creates or resumes the persistent SQLite e621 video catalog. Crawls WebM/MP4 posts once, stores post ID, URL, MD5, exact duration and sampled 10/50/90 percent timecodes, and generates three DCT perceptual hashes per video. Later runs continue from saved e621 cursors and add only newer posts while retrying transient hash failures.
+    description: Creates or resumes the persistent SQLite e621 video catalog. Crawls WebM/MP4 posts once, stores post ID, URL, MD5, exact duration and sampled 10/50/90 percent timecodes, and generates three DCT perceptual hashes per video. Later runs continue from saved e621 cursors and add only newer posts. A failed pHash row is attempted at most once per task run and can be retried on a later manual catalog update.
     defaultArgs:
       mode: catalog
       page_limit: 0

@@ -40,7 +40,7 @@ from video_match import (
     probe_duration,
 )
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 E621_BASE = "https://e621.net"
 E621_PAGE_SIZE = 75
 VIDEO_EXTENSIONS = ("webm", "mp4")
@@ -675,9 +675,19 @@ def _hash_catalog_row(
         return True
     except Exception as exc:
         catalog.set_hash_error(post_id, str(exc))
+        attempt = as_int(row.get("hash_attempts"), 0) + 1
+        remaining = max(0, HASH_RETRY_LIMIT - attempt)
+        if remaining:
+            retry_note = (
+                f"retry deferred to a later catalog update "
+                f"({remaining} automatic retries remain)"
+            )
+        else:
+            retry_note = "automatic retry limit reached"
         log(
             "WARNING",
-            f"e621 #{post_id}: pHash generation failed: {exc}",
+            f"e621 #{post_id}: pHash unavailable this run: {exc}; "
+            f"metadata retained for MD5 matching; {retry_note}",
         )
         return False
 
@@ -704,6 +714,11 @@ def build_update_catalog(
         "provider_errors": 0,
     }
 
+    # A video gets at most one pHash attempt per task invocation. Failed rows
+    # stay in SQLite for MD5 matching and may be retried on a later manual
+    # catalog update, up to HASH_RETRY_LIMIT total attempts.
+    attempted_post_ids = set()
+
     # Retry old un-hashed rows first, so an earlier transient failure does not
     # become permanently stranded behind the metadata cursor.
     retry_limit = hash_limit if hash_limit > 0 else 1000000
@@ -713,6 +728,10 @@ def build_update_catalog(
     ):
         if hash_limit and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit:
             break
+        post_id = as_int(row.get("post_id"), 0)
+        if post_id <= 0 or post_id in attempted_post_ids:
+            continue
+        attempted_post_ids.add(post_id)
         if _hash_catalog_row(catalog, row, ffmpeg_path):
             stats["hashes_generated"] += 1
         else:
@@ -785,6 +804,10 @@ def build_update_catalog(
                     and stats["hashes_generated"] + stats["hash_failures"] >= hash_limit
                 ):
                     break
+                post_id = as_int(row.get("post_id"), 0)
+                if post_id <= 0 or post_id in attempted_post_ids:
+                    continue
+                attempted_post_ids.add(post_id)
                 if _hash_catalog_row(catalog, row, ffmpeg_path):
                     stats["hashes_generated"] += 1
                 else:
