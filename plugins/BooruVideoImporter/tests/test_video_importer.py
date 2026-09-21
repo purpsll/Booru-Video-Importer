@@ -313,5 +313,30 @@ class VideoMatchTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+    def test_duration_prefilter_only_keeps_same_length_scenes(self):
+        local_index = [
+            {"scene_id": "1", "duration": 100.0, "hashes": [1, 2]},
+            {"scene_id": "2", "duration": 102.1, "hashes": [1, 2]},
+            {"scene_id": "3", "duration": 101.9, "hashes": [1, 2]},
+        ]
+        rows = plugin.source_first_duration_candidates(
+            local_index,
+            100.0,
+            2.0,
+        )
+        self.assertEqual(
+            [row["scene_id"] for row in rows],
+            ["1", "3"],
+        )
+
+    def test_duration_prefilter_rejects_unknown_remote_duration(self):
+        rows = plugin.source_first_duration_candidates(
+            [{"scene_id": "1", "duration": 100.0, "hashes": [1, 2]}],
+            0.0,
+            2.0,
+        )
+        self.assertEqual(rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()
