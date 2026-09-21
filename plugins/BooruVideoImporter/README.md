@@ -22,10 +22,12 @@ The plugin deliberately separates **discovery** from **verification**:
 1. **Fast Scan** checks the local video MD5 against e621 and Rule34. If the exact uploaded video file is found, the source metadata is imported.
 2. **Deep Reverse Search** extracts several representative JPEG frames from the local Stash video using Stash's configured FFmpeg.
 3. **SauceNAO** can use those frames to locate e621 or Rule34 post IDs. SauceNAO is only a locator; its tags are never treated as authoritative metadata.
-4. When e621 credentials are configured, the plugin also uses e621's current **ERIS-backed reverse-image search** as an additional e621-only frame locator.
+4. When e621 credentials are configured, the plugin can use e621's **ERIS-backed reverse-image search** as a limited supplemental locator. It is intentionally restricted so repeated frame uploads do not hammer e621.
 5. Candidate posts are fetched from e621 or Rule34 and must contain an actual video file.
 6. The candidate video is opened remotely with FFmpeg and compared to the local Stash video across several perceptual frame hashes.
 7. Only a high-confidence multi-frame video match imports metadata. Borderline video matches are placed in **Booru Video Review** instead.
+
+The plugin also has an **e621 source-first** mode. It scans e621 WebM/MP4 posts, hashes an early useful frame plus an early proportional frame, compares those hashes against a persistent local Stash frame index, and only then performs full multi-frame verification. This mode does not depend on ERIS to find the local scene.
 
 This prevents a single coincidentally similar frame from tagging the wrong video.
 
@@ -72,11 +74,24 @@ Runs full verification again for borderline candidates.
 **5. Retry Video No-Match Scenes**  
 Useful later when booru indexes have gained new posts.
 
+**6. Build / Refresh Local Video Frame Index**  
+Creates or refreshes the cached early-frame hashes used by source-first matching. Unchanged files reuse cached hashes.
+
+**7. Preview e621 Source-First Match (25 Posts, No Changes)**  
+Tests recent e621 WebM/MP4 posts against the local frame index without changing Stash.
+
+**8. Match e621 Videos to Local Stash**  
+Scans e621 video posts, finds likely local scenes by early-frame hashes, verifies the actual videos across multiple frames, and imports authoritative e621 metadata for verified matches.
+
 ## Settings
+
+### Protect Organized Scenes
+
+Enable **Protect Organized Scenes** to make Stash scenes marked Organized completely read-only to this plugin. Protected scenes receive no tags, performers, studio, URLs, dates, or workflow markers.
 
 ### e621
 
-e621 username + e621 API key are recommended. They enable authenticated API access and current ERIS frame discovery.
+e621 username + e621 API key are recommended. They enable authenticated API access. Source-first matching uses the normal e621 posts API and video files; ERIS is only a limited supplemental locator for the local-first reverse-search path.
 
 ### Rule34
 

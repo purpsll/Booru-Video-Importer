@@ -65,6 +65,116 @@ def extract_jpeg_frame(
     return bytes(proc.stdout)
 
 
+
+def frame_ahash_at_seconds(
+    source: str,
+    seconds: float,
+    ffmpeg_path: str = "ffmpeg",
+    timeout: int = 30,
+) -> int:
+    """Return a 64-bit average hash from a frame near an absolute timestamp."""
+    ts = max(0.05, float(seconds))
+    vf = "scale=8:8:force_original_aspect_ratio=decrease,pad=8:8:(ow-iw)/2:(oh-ih)/2,format=gray"
+    cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ts:.3f}", "-i", source,
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    raw = bytes(proc.stdout or b"")
+    if proc.returncode != 0 or len(raw) < 64:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace")[:300] or "absolute-frame extraction failed")
+    pixels = raw[:64]
+    mean = sum(pixels) / 64.0
+    value = 0
+    for pixel in pixels:
+        value = (value << 1) | (1 if pixel >= mean else 0)
+    return value
+
+
+def image_ahash(
+    source: str,
+    ffmpeg_path: str = "ffmpeg",
+    timeout: int = 30,
+) -> int:
+    """Return the same 64-bit average hash for a still image/preview URL."""
+    vf = "scale=8:8:force_original_aspect_ratio=decrease,pad=8:8:(ow-iw)/2:(oh-ih)/2,format=gray"
+    cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-i", source,
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    raw = bytes(proc.stdout or b"")
+    if proc.returncode != 0 or len(raw) < 64:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace")[:300] or "preview hash extraction failed")
+    pixels = raw[:64]
+    mean = sum(pixels) / 64.0
+    value = 0
+    for pixel in pixels:
+        value = (value << 1) | (1 if pixel >= mean else 0)
+    return value
+
+
+def early_frame_hashes(
+    source: str,
+    duration: float,
+    ffmpeg_path: str = "ffmpeg",
+    timeout: int = 30,
+) -> List[int]:
+    """Hash a first-useful frame and an early proportional frame.
+
+    About one second avoids literal frame-zero black/fade frames. Ten percent adds
+    enough temporal diversity to make the cheap source-first candidate filter useful.
+    """
+    duration = max(0.1, float(duration))
+    first_seconds = min(1.0, max(0.05, duration * 0.02))
+    second_ratio = 0.10
+    values = [
+        frame_ahash_at_seconds(source, first_seconds, ffmpeg_path, timeout),
+        frame_ahash(source, duration, second_ratio, ffmpeg_path, timeout),
+    ]
+    # Keep stable order but avoid duplicate hashes on very short/static videos.
+    return list(dict.fromkeys(values))
+
+
+def early_hash_candidate(
+    local_hashes: Iterable[int],
+    remote_hashes: Iterable[int],
+    max_distance: int = 10,
+) -> Dict[str, object]:
+    """Score a cheap two-frame source-first candidate before full verification."""
+    local = [int(x) for x in local_hashes]
+    remote = [int(x) for x in remote_hashes]
+    if not local or not remote:
+        return {
+            "candidate": False,
+            "matched": 0,
+            "min_distance": 64,
+            "median_distance": 64.0,
+            "distances": [],
+        }
+
+    nearest = [min(hamming_distance(r, l) for l in local) for r in remote]
+    matched = sum(1 for d in nearest if d <= max_distance)
+    median = float(statistics.median(nearest)) if nearest else 64.0
+    minimum = min(nearest) if nearest else 64
+
+    # Two agreeing early hashes are strong enough to justify expensive full-video
+    # verification. One near-identical hash is also allowed as a candidate because
+    # a short intro/trim can move the second sample.
+    candidate = matched >= min(2, len(remote)) or minimum <= 4
+    return {
+        "candidate": candidate,
+        "matched": matched,
+        "min_distance": minimum,
+        "median_distance": round(median, 2),
+        "distances": nearest,
+    }
+
+
 def frame_ahash(
     source: str,
     duration: float,
@@ -116,6 +226,8 @@ def verify_video_candidate(
     timeout: int = 45,
     local_duration: float | None = None,
     local_hashes: List[int] | None = None,
+    remote_duration: float | None = None,
+    remote_hashes: List[int] | None = None,
 ) -> Dict[str, object]:
     """Compare several perceptual frames while tolerating modest trim/timing shifts.
 
@@ -124,9 +236,9 @@ def verify_video_candidate(
     """
     ratios = tuple(ratios)
     local_duration = local_duration or probe_duration(local_source, ffmpeg_path, timeout)
-    remote_duration = probe_duration(remote_source, ffmpeg_path, timeout)
+    remote_duration = remote_duration or probe_duration(remote_source, ffmpeg_path, timeout)
     local_hashes = local_hashes or frame_hashes(local_source, local_duration, ffmpeg_path, ratios, timeout)
-    remote_hashes = frame_hashes(remote_source, remote_duration, ffmpeg_path, ratios, timeout)
+    remote_hashes = remote_hashes or frame_hashes(remote_source, remote_duration, ffmpeg_path, ratios, timeout)
 
     nearest: List[int] = []
     for local_hash in local_hashes:

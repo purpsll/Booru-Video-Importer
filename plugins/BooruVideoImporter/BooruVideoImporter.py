@@ -28,15 +28,18 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from stash_client import Stash, fingerprint, primary_video
+from source_index import load_cache, save_cache, scene_signature
 from video_match import (
     DEFAULT_RATIOS,
+    early_frame_hashes,
+    early_hash_candidate,
     extract_jpeg_frame,
     frame_hashes,
     probe_duration,
     verify_video_candidate,
 )
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -62,6 +65,9 @@ MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
 VERIFY_FRAME_DISTANCE = 8
+E621_SOURCE_PAGE_SIZE = 75
+E621_SOURCE_MAX_CANDIDATES = 5
+E621_SOURCE_EARLY_DISTANCE = 10
 
 _LAST_E621_REQUEST = 0.0
 _LAST_E621_ERIS = 0.0
@@ -168,33 +174,111 @@ def e621_request(url: str, username: str, api_key: str) -> Any:
     return _json_request(url, headers=e621_headers(username, api_key))
 
 
+def _e621_posts(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [post for post in payload if isinstance(post, dict)]
+    if isinstance(payload, dict):
+        posts = payload.get("posts")
+        if isinstance(posts, list):
+            return [post for post in posts if isinstance(post, dict)]
+        post = payload.get("post")
+        if isinstance(post, dict):
+            return [post]
+        if payload.get("id"):
+            return [payload]
+    return []
+
+
+def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize e621's legacy and current v2 file schemas."""
+    legacy = post.get("file")
+    if isinstance(legacy, dict):
+        preview = post.get("preview") or {}
+        return {
+            "ext": str(legacy.get("ext") or "").casefold().lstrip("."),
+            "url": str(legacy.get("url") or "").strip(),
+            "md5": str(legacy.get("md5") or "").strip(),
+            "duration": as_float(legacy.get("duration") or post.get("duration"), 0.0),
+            "preview_url": str(
+                preview.get("url") if isinstance(preview, dict) else ""
+            ).strip(),
+        }
+
+    files = post.get("files")
+    if isinstance(files, dict):
+        meta = files.get("meta") or {}
+        original = files.get("original") or {}
+        preview = files.get("preview") or {}
+        preview_url = ""
+        if isinstance(preview, dict):
+            preview_url = str(preview.get("jpg") or preview.get("webp") or "").strip()
+        return {
+            "ext": str(meta.get("ext") or "").casefold().lstrip("."),
+            "url": str(original.get("url") if isinstance(original, dict) else "").strip(),
+            "md5": str(meta.get("md5") or "").strip(),
+            "duration": as_float(meta.get("duration"), 0.0),
+            "preview_url": preview_url,
+        }
+
+    return {"ext": "", "url": "", "md5": "", "duration": 0.0, "preview_url": ""}
+
+
 def e621_post_by_id(post_id: str, username: str, api_key: str) -> Optional[Dict[str, Any]]:
+    params = urllib.parse.urlencode({"v2": "true", "mode": "extended"})
     payload = e621_request(
-        f"{E621_BASE}/posts/{urllib.parse.quote(str(post_id))}.json",
+        f"{E621_BASE}/posts/{urllib.parse.quote(str(post_id))}.json?{params}",
         username,
         api_key,
     )
-    if isinstance(payload, dict):
-        post = payload.get("post")
-        if isinstance(post, dict):
-            return post
-        if payload.get("id"):
-            return payload
-    return None
+    posts = _e621_posts(payload)
+    return posts[0] if posts else None
 
 
 def e621_post_by_md5(md5: str, username: str, api_key: str) -> Optional[Dict[str, Any]]:
-    params = urllib.parse.urlencode({"tags": f"md5:{md5}", "limit": "1"})
+    params = urllib.parse.urlencode(
+        {"tags": f"md5:{md5}", "limit": "1", "v2": "true", "mode": "extended"}
+    )
     payload = e621_request(f"{E621_BASE}/posts.json?{params}", username, api_key)
-    posts = payload.get("posts") if isinstance(payload, dict) else None
-    if not isinstance(posts, list):
-        return None
-    for post in posts:
-        if not isinstance(post, dict):
-            continue
-        if str((post.get("file") or {}).get("md5") or "").casefold() == md5.casefold():
+    for post in _e621_posts(payload):
+        if str(e621_file_info(post).get("md5") or "").casefold() == md5.casefold():
             return post
     return None
+
+
+def e621_video_posts_page(
+    username: str,
+    api_key: str,
+    before_id: Optional[int] = None,
+    limit: int = E621_SOURCE_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    """Fetch one source-first page of current e621 WebM/MP4 posts."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    limit = max(1, min(320, int(limit)))
+
+    for ext in ("webm", "mp4"):
+        params: Dict[str, str] = {
+            "tags": f"type:{ext}",
+            "limit": str(limit),
+            "v2": "true",
+            "mode": "extended",
+        }
+        if before_id:
+            params["page"] = f"b{int(before_id)}"
+        payload = e621_request(
+            f"{E621_BASE}/posts.json?{urllib.parse.urlencode(params)}",
+            username,
+            api_key,
+        )
+        for post in _e621_posts(payload):
+            post_id = str(post.get("id") or "")
+            if post_id and e621_file_info(post).get("ext") in {"webm", "mp4"}:
+                merged[post_id] = post
+
+    return sorted(
+        merged.values(),
+        key=lambda post: as_int(post.get("id"), 0),
+        reverse=True,
+    )
 
 
 def _multipart(boundary: str, fields: Dict[str, str], data: bytes, filename: str) -> bytes:
@@ -521,9 +605,9 @@ def saucenao_candidates(
 
 def media_url(source: str, post: Dict[str, Any]) -> Optional[str]:
     if source == "e621":
-        file_obj = post.get("file") or {}
-        ext = str(file_obj.get("ext") or "").casefold().lstrip(".")
-        url = str(file_obj.get("url") or "").strip()
+        info = e621_file_info(post)
+        ext = str(info.get("ext") or "").casefold().lstrip(".")
+        url = str(info.get("url") or "").strip()
         return url if ext in VIDEO_EXTENSIONS and url else None
     url = str(post.get("file_url") or "").strip()
     if not url:
@@ -607,6 +691,14 @@ def post_metadata(source: str, post: Dict[str, Any], settings: Dict[str, Any]) -
     }
 
 
+def skip_organized_enabled(settings: Dict[str, Any]) -> bool:
+    return as_bool(settings.get("skip_organized_scenes"), False)
+
+
+def protected_organized_scene(scene: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    return skip_organized_enabled(settings) and bool(scene.get("organized"))
+
+
 def _status_names(scene: Dict[str, Any]) -> set[str]:
     return {
         str(tag.get("name") or "").casefold()
@@ -679,6 +771,13 @@ def apply_metadata(
     studio_cache: Dict[str, Dict[str, Any]],
     dry_run: bool,
 ) -> None:
+    if protected_organized_scene(scene, settings):
+        log(
+            "INFO",
+            f"Scene {scene.get('id')}: Organized protection is enabled; metadata unchanged",
+        )
+        return
+
     metadata = post_metadata(source, post, settings)
 
     existing_tag_ids = [
@@ -791,6 +890,7 @@ def discover_candidates(
     if not have_sauce and not have_eris:
         return [], True
 
+    eris_checked = False
     for ratio in DISCOVERY_RATIOS:
         try:
             frame = extract_jpeg_frame(local_path, duration, ratio, ffmpeg_path, timeout=45)
@@ -809,18 +909,25 @@ def discover_candidates(
                 log("WARNING", f"SauceNAO video-frame lookup failed: {exc}")
                 had_error = True
 
-        # SauceNAO is the primary frame locator. ERIS is only an e621 fallback
-        # when SauceNAO did not already identify an e621 post for this frame.
+        # SauceNAO is the primary multi-frame locator. ERIS gets at most one
+        # representative frame per video so heavy reverse-image uploads cannot
+        # hammer e621/Cloudflare.
         sauce_found_e621 = any(source == "e621" for source, _post_id in frame_hits)
-        if have_eris and not _ERIS_DISABLED_FOR_RUN and not sauce_found_e621:
+        representative = abs(float(ratio) - 0.52) < 0.001
+        if (
+            have_eris
+            and not eris_checked
+            and representative
+            and not _ERIS_DISABLED_FOR_RUN
+            and not sauce_found_e621
+        ):
+            eris_checked = True
             try:
                 for score, post_id in e621_eris_candidates(frame, username, api_key):
                     key = ("e621", post_id)
                     frame_hits[key] = max(frame_hits.get(key, 0.0), float(score))
             except Exception as exc:
                 log("WARNING", f"e621 ERIS video-frame lookup failed: {exc}")
-                # ERIS is optional when SauceNAO is configured. Without SauceNAO,
-                # a real ERIS failure makes this scan incomplete and retryable.
                 if not have_sauce:
                     had_error = True
 
@@ -843,6 +950,445 @@ def discover_candidates(
     return ranked[:MAX_CANDIDATES], had_error
 
 
+
+def build_local_source_index(
+    stash: Stash,
+    settings: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Build or refresh the cached early-frame index for eligible local scenes."""
+    ffmpeg_path = stash.ffmpeg_path()
+    cache = load_cache()
+    cached = cache.setdefault("scenes", {})
+    if not isinstance(cached, dict):
+        cached = {}
+        cache["scenes"] = cached
+
+    rows: List[Dict[str, Any]] = []
+    active_ids: set[str] = set()
+    stats = {
+        "scenes_seen": 0,
+        "indexed": 0,
+        "reused": 0,
+        "skipped": 0,
+        "skipped_organized": 0,
+        "errors": 0,
+    }
+
+    page = 1
+    per_page = 100
+    while True:
+        count, scenes = stash.find_scenes(page, per_page)
+        if not scenes:
+            break
+
+        for scene in scenes:
+            stats["scenes_seen"] += 1
+            sid = str(scene.get("id") or "")
+            if not sid:
+                stats["skipped"] += 1
+                continue
+            if protected_organized_scene(scene, settings):
+                stats["skipped_organized"] += 1
+                continue
+            if STATUS_IMPORTED.casefold() in _status_names(scene):
+                stats["skipped"] += 1
+                continue
+            if any("e621.net/posts/" in str(url) for url in scene.get("urls") or []):
+                stats["skipped"] += 1
+                continue
+
+            video = primary_video(scene)
+            if not video:
+                stats["skipped"] += 1
+                continue
+            local_path = str(video.get("path") or "").strip()
+            if not local_path:
+                stats["skipped"] += 1
+                continue
+
+            signature = scene_signature(scene)
+            duration = as_float(video.get("duration"), 0.0)
+            entry = cached.get(sid) if isinstance(cached.get(sid), dict) else None
+            hashes: List[int] = []
+
+            if (
+                not force
+                and entry
+                and str(entry.get("signature") or "") == signature
+                and isinstance(entry.get("hashes"), list)
+                and entry.get("hashes")
+            ):
+                try:
+                    hashes = [int(value) for value in entry["hashes"]]
+                    duration = as_float(entry.get("duration"), duration)
+                    stats["reused"] += 1
+                except (TypeError, ValueError):
+                    hashes = []
+
+            if not hashes:
+                try:
+                    if duration <= 0:
+                        duration = probe_duration(local_path, ffmpeg_path, 30)
+                    hashes = early_frame_hashes(
+                        local_path,
+                        duration,
+                        ffmpeg_path=ffmpeg_path,
+                        timeout=45,
+                    )
+                    cached[sid] = {
+                        "signature": signature,
+                        "duration": round(float(duration), 3),
+                        "path": local_path,
+                        "hashes": [int(value) for value in hashes],
+                    }
+                    stats["indexed"] += 1
+                except Exception as exc:
+                    stats["errors"] += 1
+                    log("WARNING", f"Scene {sid}: could not build early-frame index: {exc}")
+                    continue
+
+            active_ids.add(sid)
+            rows.append(
+                {
+                    "scene": scene,
+                    "scene_id": sid,
+                    "path": local_path,
+                    "duration": float(duration),
+                    "hashes": hashes,
+                }
+            )
+
+        if count:
+            progress(min(1.0, (page * per_page) / max(1, count)))
+        if page * per_page >= count:
+            break
+        page += 1
+
+    # Remove stale cache entries only after a complete scan. Protected/imported
+    # scenes are intentionally omitted so toggling protection later simply rebuilds them.
+    cache["scenes"] = {
+        sid: cached[sid]
+        for sid in active_ids
+        if sid in cached and isinstance(cached[sid], dict)
+    }
+    try:
+        save_cache(cache)
+    except OSError as exc:
+        log("WARNING", f"Could not save local video hash index: {exc}")
+
+    log(
+        "INFO",
+        "Local source-first index: "
+        f"{len(rows)} eligible; {stats['indexed']} built; {stats['reused']} reused; "
+        f"{stats['skipped_organized']} organized protected; {stats['errors']} errors",
+    )
+    return rows, stats
+
+
+def _duration_delta(local_duration: float, remote_duration: float) -> float:
+    local_duration = max(0.0, float(local_duration))
+    remote_duration = max(0.0, float(remote_duration))
+    if local_duration <= 0 or remote_duration <= 0:
+        return 0.0
+    return abs(local_duration - remote_duration) / max(local_duration, remote_duration)
+
+
+def source_first_local_candidates(
+    local_index: Sequence[Dict[str, Any]],
+    remote_hashes: Sequence[int],
+    remote_duration: float,
+) -> List[Tuple[Tuple[float, float, float], Dict[str, Any], Dict[str, object]]]:
+    ranked: List[
+        Tuple[Tuple[float, float, float], Dict[str, Any], Dict[str, object]]
+    ] = []
+
+    for entry in local_index:
+        early = early_hash_candidate(
+            entry.get("hashes") or [],
+            remote_hashes,
+            max_distance=E621_SOURCE_EARLY_DISTANCE,
+        )
+        if not early.get("candidate"):
+            continue
+
+        duration_delta = _duration_delta(
+            as_float(entry.get("duration"), 0.0),
+            remote_duration,
+        )
+        # A very close early frame can survive a trim/duration mismatch and will
+        # still have to pass full multi-frame verification. Otherwise discard
+        # wildly different durations before expensive remote verification.
+        if duration_delta > 0.40 and int(early.get("min_distance") or 64) > 2:
+            continue
+
+        rank = (
+            float(early.get("matched") or 0),
+            -float(early.get("median_distance") or 64.0),
+            -duration_delta,
+        )
+        ranked.append((rank, entry, early))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked[:E621_SOURCE_MAX_CANDIDATES]
+
+
+def source_first_e621(
+    stash: Stash,
+    settings: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, int]:
+    """Scan e621 videos outward and compare their early frames to local Stash."""
+    dry_run = as_bool(args.get("dry_run"), False)
+    force_index = as_bool(args.get("force_index"), False)
+    post_limit = max(0, as_int(args.get("source_post_limit"), 0))
+    configured_pages = as_int(settings.get("e621_source_pages"), 5)
+    source_pages = max(
+        1,
+        min(100, as_int(args.get("source_pages"), configured_pages or 5)),
+    )
+    username = str(settings.get("e621_username") or "")
+    api_key = str(settings.get("e621_api_key") or "")
+    ffmpeg_path = stash.ffmpeg_path()
+
+    local_index, index_stats = build_local_source_index(
+        stash,
+        settings,
+        force=force_index,
+    )
+
+    tag_cache = stash.all_tags()
+    performer_cache = stash.all_performers()
+    studio_cache = stash.all_studios()
+
+    stats = {
+        "posts_seen": 0,
+        "video_posts": 0,
+        "early_candidates": 0,
+        "verified_matches": 0,
+        "review_candidates": 0,
+        "provider_errors": 0,
+        "local_index_size": len(local_index),
+        "organized_protected": int(index_stats.get("skipped_organized") or 0),
+    }
+    if not local_index:
+        log("INFO", "e621 source-first scan stopped: no eligible local scenes in index")
+        return stats
+
+    before_id: Optional[int] = None
+    stop = False
+    for page_number in range(source_pages):
+        try:
+            posts = e621_video_posts_page(
+                username,
+                api_key,
+                before_id=before_id,
+                limit=E621_SOURCE_PAGE_SIZE,
+            )
+        except Exception as exc:
+            stats["provider_errors"] += 1
+            log("WARNING", f"e621 source-first page lookup failed: {exc}")
+            break
+
+        if not posts:
+            break
+
+        ids = [as_int(post.get("id"), 0) for post in posts if as_int(post.get("id"), 0) > 0]
+        if ids:
+            before_id = min(ids)
+
+        for post in posts:
+            if post_limit and stats["posts_seen"] >= post_limit:
+                stop = True
+                break
+
+            stats["posts_seen"] += 1
+            remote_url = media_url("e621", post)
+            if not remote_url:
+                continue
+            stats["video_posts"] += 1
+
+            info = e621_file_info(post)
+            remote_duration = as_float(info.get("duration"), 0.0)
+            try:
+                if remote_duration <= 0:
+                    remote_duration = probe_duration(remote_url, ffmpeg_path, 45)
+                remote_early = early_frame_hashes(
+                    remote_url,
+                    remote_duration,
+                    ffmpeg_path=ffmpeg_path,
+                    timeout=60,
+                )
+            except Exception as exc:
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"e621 post {post.get('id')}: early-frame extraction failed: {exc}",
+                )
+                continue
+
+            candidates = source_first_local_candidates(
+                local_index,
+                remote_early,
+                remote_duration,
+            )
+            if not candidates:
+                if post_limit:
+                    progress(stats["posts_seen"] / max(1, post_limit))
+                continue
+
+            stats["early_candidates"] += len(candidates)
+
+            try:
+                remote_full_hashes = frame_hashes(
+                    remote_url,
+                    remote_duration,
+                    ffmpeg_path=ffmpeg_path,
+                    ratios=DEFAULT_RATIOS,
+                    timeout=60,
+                )
+            except Exception as exc:
+                stats["provider_errors"] += 1
+                log(
+                    "WARNING",
+                    f"e621 post {post.get('id')}: full verification frames failed: {exc}",
+                )
+                continue
+
+            best_review: Optional[
+                Tuple[float, Dict[str, Any], Dict[str, object]]
+            ] = None
+            matched_entry: Optional[Dict[str, Any]] = None
+
+            for _rank, entry, early in candidates:
+                scene = entry["scene"]
+                if protected_organized_scene(scene, settings):
+                    continue
+
+                try:
+                    local_full_hashes = entry.get("_full_hashes")
+                    if not isinstance(local_full_hashes, list) or not local_full_hashes:
+                        local_full_hashes = frame_hashes(
+                            str(entry["path"]),
+                            float(entry["duration"]),
+                            ffmpeg_path=ffmpeg_path,
+                            ratios=DEFAULT_RATIOS,
+                            timeout=45,
+                        )
+                        entry["_full_hashes"] = local_full_hashes
+
+                    verification = verify_video_candidate(
+                        str(entry["path"]),
+                        remote_url,
+                        ffmpeg_path=ffmpeg_path,
+                        ratios=DEFAULT_RATIOS,
+                        frame_distance=VERIFY_FRAME_DISTANCE,
+                        timeout=60,
+                        local_duration=float(entry["duration"]),
+                        local_hashes=local_full_hashes,
+                        remote_duration=remote_duration,
+                        remote_hashes=remote_full_hashes,
+                    )
+                except Exception as exc:
+                    stats["provider_errors"] += 1
+                    log(
+                        "WARNING",
+                        f"Scene {entry['scene_id']}: source-first verification failed "
+                        f"against e621 #{post.get('id')}: {exc}",
+                    )
+                    continue
+
+                matched_frames = int(verification.get("matched_frames") or 0)
+                total_frames = int(verification.get("total_frames") or 0)
+                median = float(verification.get("median_distance") or 64.0)
+                log(
+                    "INFO",
+                    f"e621 #{post.get('id')} -> Scene {entry['scene_id']}: "
+                    f"early distances {early.get('distances')}; verification "
+                    f"{matched_frames}/{total_frames}, median {median:.1f}",
+                )
+
+                if verification.get("high"):
+                    if not dry_run:
+                        apply_metadata(
+                            stash,
+                            scene,
+                            "e621",
+                            post,
+                            settings,
+                            tag_cache,
+                            performer_cache,
+                            studio_cache,
+                            False,
+                        )
+                    stats["verified_matches"] += 1
+                    matched_entry = entry
+                    log(
+                        "INFO",
+                        f"e621 source-first MATCH: post #{post.get('id')} -> "
+                        f"Stash Scene {entry['scene_id']}"
+                        + (" (preview only)" if dry_run else ""),
+                    )
+                    break
+
+                if verification.get("review"):
+                    review_rank = matched_frames * 100.0 - median
+                    if best_review is None or review_rank > best_review[0]:
+                        best_review = (review_rank, entry, verification)
+
+            if matched_entry is not None:
+                # One local scene should not be repeatedly matched to multiple e621
+                # posts during the same scan.
+                local_index = [
+                    entry
+                    for entry in local_index
+                    if entry.get("scene_id") != matched_entry.get("scene_id")
+                ]
+            elif best_review is not None:
+                _, entry, verification = best_review
+                stats["review_candidates"] += 1
+                if not dry_run and not protected_organized_scene(entry["scene"], settings):
+                    transition_status(
+                        stash,
+                        entry["scene"],
+                        STATUS_REVIEW,
+                        tag_cache,
+                        extra_url=canonical_post_url("e621", post),
+                    )
+                log(
+                    "INFO",
+                    f"e621 source-first REVIEW: post #{post.get('id')} -> "
+                    f"Scene {entry['scene_id']} "
+                    f"({verification.get('matched_frames')}/{verification.get('total_frames')} frames)",
+                )
+
+            if post_limit:
+                progress(stats["posts_seen"] / max(1, post_limit))
+
+        if stop:
+            break
+        if not ids:
+            break
+        if not post_limit:
+            progress((page_number + 1) / source_pages)
+
+    return stats
+
+
+def build_source_index_task(
+    stash: Stash,
+    settings: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, int]:
+    _rows, stats = build_local_source_index(
+        stash,
+        settings,
+        force=as_bool(args.get("force_index"), False),
+    )
+    return stats
+
+
 def process_scene(
     stash: Stash,
     scene: Dict[str, Any],
@@ -855,6 +1401,10 @@ def process_scene(
     studio_cache: Dict[str, Dict[str, Any]],
 ) -> str:
     sid = str(scene.get("id") or "")
+    if protected_organized_scene(scene, settings):
+        log("INFO", f"Scene {sid}: skipped because Stash marks it Organized")
+        return "skipped_organized"
+
     video = primary_video(scene)
     if not video:
         return "skipped"
@@ -1018,21 +1568,26 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         "no_match": 0,
         "retry_later": 0,
         "skipped": 0,
+        "skipped_organized": 0,
     }
 
-    page = 1
     per_page = 100
-    stop = False
-    while not stop:
-        count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
-        if not scenes:
-            break
-        for scene in scenes:
-            statuses = _status_names(scene)
-            if not target_tag_id and statuses:
-                continue
+
+    if target_tag_id:
+        # Snapshot the queue before modifying statuses. This prevents page shifting
+        # and prevents protected/no-match scenes that keep the same status from
+        # being processed forever.
+        queued: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
+            queued.extend(scenes)
+            if page * per_page >= count or not scenes:
+                break
+            page += 1
+
+        for scene in queued:
             if limit and stats["seen"] >= limit:
-                stop = True
                 break
             stats["seen"] += 1
             result = process_scene(
@@ -1046,20 +1601,40 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
                 studio_cache=studio_cache,
             )
             stats[result] = stats.get(result, 0) + 1
-            if limit:
-                progress(stats["seen"] / max(1, limit))
-            elif count:
-                progress(min(1.0, stats["seen"] / max(1, count)))
-        if target_tag_id:
-            # Queue membership shrinks as status tags are replaced. Re-read page 1
-            # so changing pagination cannot skip scenes.
-            if dry_run:
+            progress(stats["seen"] / max(1, min(len(queued), limit or len(queued))))
+    else:
+        page = 1
+        stop = False
+        while not stop:
+            count, scenes = stash.find_scenes(page, per_page)
+            if not scenes:
                 break
-            page = 1
-            continue
-        if page * per_page >= count:
-            break
-        page += 1
+            for scene in scenes:
+                statuses = _status_names(scene)
+                if statuses:
+                    continue
+                if limit and stats["seen"] >= limit:
+                    stop = True
+                    break
+                stats["seen"] += 1
+                result = process_scene(
+                    stash,
+                    scene,
+                    settings,
+                    deep=deep,
+                    dry_run=dry_run,
+                    tag_cache=tag_cache,
+                    performer_cache=performer_cache,
+                    studio_cache=studio_cache,
+                )
+                stats[result] = stats.get(result, 0) + 1
+                if limit:
+                    progress(stats["seen"] / max(1, limit))
+                elif count:
+                    progress(min(1.0, stats["seen"] / max(1, count)))
+            if page * per_page >= count:
+                break
+            page += 1
 
     return stats
 
@@ -1070,9 +1645,14 @@ def main() -> None:
     settings = stash.settings()
     args = payload.get("args") or {}
     mode = str(args.get("mode") or "import_all")
-    if mode != "import_all":
+    if mode == "import_all":
+        stats = import_all(stash, settings, args)
+    elif mode == "build_source_index":
+        stats = build_source_index_task(stash, settings, args)
+    elif mode == "source_first_e621":
+        stats = source_first_e621(stash, settings, args)
+    else:
         raise RuntimeError(f"Unsupported mode: {mode}")
-    stats = import_all(stash, settings, args)
     log("INFO", f"Finished Booru Video Importer: {stats}")
     print(json.dumps({"output": "ok", "stats": stats}))
 
