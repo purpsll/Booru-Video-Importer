@@ -174,33 +174,111 @@ def e621_request(url: str, username: str, api_key: str) -> Any:
     return _json_request(url, headers=e621_headers(username, api_key))
 
 
+def _e621_posts(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [post for post in payload if isinstance(post, dict)]
+    if isinstance(payload, dict):
+        posts = payload.get("posts")
+        if isinstance(posts, list):
+            return [post for post in posts if isinstance(post, dict)]
+        post = payload.get("post")
+        if isinstance(post, dict):
+            return [post]
+        if payload.get("id"):
+            return [payload]
+    return []
+
+
+def e621_file_info(post: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize e621's legacy and current v2 file schemas."""
+    legacy = post.get("file")
+    if isinstance(legacy, dict):
+        preview = post.get("preview") or {}
+        return {
+            "ext": str(legacy.get("ext") or "").casefold().lstrip("."),
+            "url": str(legacy.get("url") or "").strip(),
+            "md5": str(legacy.get("md5") or "").strip(),
+            "duration": as_float(legacy.get("duration") or post.get("duration"), 0.0),
+            "preview_url": str(
+                preview.get("url") if isinstance(preview, dict) else ""
+            ).strip(),
+        }
+
+    files = post.get("files")
+    if isinstance(files, dict):
+        meta = files.get("meta") or {}
+        original = files.get("original") or {}
+        preview = files.get("preview") or {}
+        preview_url = ""
+        if isinstance(preview, dict):
+            preview_url = str(preview.get("jpg") or preview.get("webp") or "").strip()
+        return {
+            "ext": str(meta.get("ext") or "").casefold().lstrip("."),
+            "url": str(original.get("url") if isinstance(original, dict) else "").strip(),
+            "md5": str(meta.get("md5") or "").strip(),
+            "duration": as_float(meta.get("duration"), 0.0),
+            "preview_url": preview_url,
+        }
+
+    return {"ext": "", "url": "", "md5": "", "duration": 0.0, "preview_url": ""}
+
+
 def e621_post_by_id(post_id: str, username: str, api_key: str) -> Optional[Dict[str, Any]]:
+    params = urllib.parse.urlencode({"v2": "true", "mode": "extended"})
     payload = e621_request(
-        f"{E621_BASE}/posts/{urllib.parse.quote(str(post_id))}.json",
+        f"{E621_BASE}/posts/{urllib.parse.quote(str(post_id))}.json?{params}",
         username,
         api_key,
     )
-    if isinstance(payload, dict):
-        post = payload.get("post")
-        if isinstance(post, dict):
-            return post
-        if payload.get("id"):
-            return payload
-    return None
+    posts = _e621_posts(payload)
+    return posts[0] if posts else None
 
 
 def e621_post_by_md5(md5: str, username: str, api_key: str) -> Optional[Dict[str, Any]]:
-    params = urllib.parse.urlencode({"tags": f"md5:{md5}", "limit": "1"})
+    params = urllib.parse.urlencode(
+        {"tags": f"md5:{md5}", "limit": "1", "v2": "true", "mode": "extended"}
+    )
     payload = e621_request(f"{E621_BASE}/posts.json?{params}", username, api_key)
-    posts = payload.get("posts") if isinstance(payload, dict) else None
-    if not isinstance(posts, list):
-        return None
-    for post in posts:
-        if not isinstance(post, dict):
-            continue
-        if str((post.get("file") or {}).get("md5") or "").casefold() == md5.casefold():
+    for post in _e621_posts(payload):
+        if str(e621_file_info(post).get("md5") or "").casefold() == md5.casefold():
             return post
     return None
+
+
+def e621_video_posts_page(
+    username: str,
+    api_key: str,
+    before_id: Optional[int] = None,
+    limit: int = E621_SOURCE_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    """Fetch one source-first page of current e621 WebM/MP4 posts."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    limit = max(1, min(320, int(limit)))
+
+    for ext in ("webm", "mp4"):
+        params: Dict[str, str] = {
+            "tags": f"type:{ext}",
+            "limit": str(limit),
+            "v2": "true",
+            "mode": "extended",
+        }
+        if before_id:
+            params["page"] = f"b{int(before_id)}"
+        payload = e621_request(
+            f"{E621_BASE}/posts.json?{urllib.parse.urlencode(params)}",
+            username,
+            api_key,
+        )
+        for post in _e621_posts(payload):
+            post_id = str(post.get("id") or "")
+            if post_id and e621_file_info(post).get("ext") in {"webm", "mp4"}:
+                merged[post_id] = post
+
+    return sorted(
+        merged.values(),
+        key=lambda post: as_int(post.get("id"), 0),
+        reverse=True,
+    )
 
 
 def _multipart(boundary: str, fields: Dict[str, str], data: bytes, filename: str) -> bytes:
