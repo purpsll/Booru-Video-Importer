@@ -54,7 +54,7 @@ For e621 source-first matching:
 
 The local frame index is cached and unchanged files reuse their hashes on later runs.
 
-Source-first matching is intentionally strict: both early frames must match at the same positions, durations must be close, and final verification compares stronger 256-bit perceptual hashes at aligned timestamps. **Allow Source-First Auto Import** is off by default, so verified source-first results go to Review until you explicitly enable automatic metadata writes.
+Source-first matching is intentionally strict: both early frames must match at the same positions, duration is filtered to within 1 second by default, and final verification compares stronger 256-bit perceptual hashes at seven aligned timestamps. A high-confidence result requires all seven sampled frames to pass plus nearly identical runtime. **Allow Source-First Auto Import** is off by default, so verified source-first results go to Review until you explicitly enable automatic metadata writes.
 
 The plugin uses its own status tags and does not share queues with the image Booru Importer.
 
@@ -67,6 +67,14 @@ For best results configure:
 - SauceNAO API key
 
 SauceNAO is used only for candidate discovery. Imported metadata always comes from the matched source post.
+
+## Scope Matching to Any Stash Tag
+
+Use **Stash Tag Scope (any tag or alias)** to limit the plugin to a subset of your local Stash videos.
+
+For example, entering `furry` makes the plugin process only scenes that already carry the Stash tag `furry`. The value is resolved live against the Stash tag database, including aliases, so it is not limited to a hardcoded list and future/custom tags work automatically. Leave the setting blank to process all eligible videos.
+
+This scope applies to Fast Scan, Deep Scan, Review/Retry queues, local frame indexing, and e621 source-first matching.
 
 ## Protect Organized Scenes
 
