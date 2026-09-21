@@ -890,6 +890,7 @@ def discover_candidates(
     if not have_sauce and not have_eris:
         return [], True
 
+    eris_checked = False
     for ratio in DISCOVERY_RATIOS:
         try:
             frame = extract_jpeg_frame(local_path, duration, ratio, ffmpeg_path, timeout=45)
@@ -908,18 +909,25 @@ def discover_candidates(
                 log("WARNING", f"SauceNAO video-frame lookup failed: {exc}")
                 had_error = True
 
-        # SauceNAO is the primary frame locator. ERIS is only an e621 fallback
-        # when SauceNAO did not already identify an e621 post for this frame.
+        # SauceNAO is the primary multi-frame locator. ERIS gets at most one
+        # representative frame per video so heavy reverse-image uploads cannot
+        # hammer e621/Cloudflare.
         sauce_found_e621 = any(source == "e621" for source, _post_id in frame_hits)
-        if have_eris and not _ERIS_DISABLED_FOR_RUN and not sauce_found_e621:
+        representative = abs(float(ratio) - 0.52) < 0.001
+        if (
+            have_eris
+            and not eris_checked
+            and representative
+            and not _ERIS_DISABLED_FOR_RUN
+            and not sauce_found_e621
+        ):
+            eris_checked = True
             try:
                 for score, post_id in e621_eris_candidates(frame, username, api_key):
                     key = ("e621", post_id)
                     frame_hits[key] = max(frame_hits.get(key, 0.0), float(score))
             except Exception as exc:
                 log("WARNING", f"e621 ERIS video-frame lookup failed: {exc}")
-                # ERIS is optional when SauceNAO is configured. Without SauceNAO,
-                # a real ERIS failure makes this scan incomplete and retryable.
                 if not have_sauce:
                     had_error = True
 
@@ -1563,19 +1571,23 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         "skipped_organized": 0,
     }
 
-    page = 1
     per_page = 100
-    stop = False
-    while not stop:
-        count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
-        if not scenes:
-            break
-        for scene in scenes:
-            statuses = _status_names(scene)
-            if not target_tag_id and statuses:
-                continue
+
+    if target_tag_id:
+        # Snapshot the queue before modifying statuses. This prevents page shifting
+        # and prevents protected/no-match scenes that keep the same status from
+        # being processed forever.
+        queued: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
+            queued.extend(scenes)
+            if page * per_page >= count or not scenes:
+                break
+            page += 1
+
+        for scene in queued:
             if limit and stats["seen"] >= limit:
-                stop = True
                 break
             stats["seen"] += 1
             result = process_scene(
@@ -1589,20 +1601,40 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
                 studio_cache=studio_cache,
             )
             stats[result] = stats.get(result, 0) + 1
-            if limit:
-                progress(stats["seen"] / max(1, limit))
-            elif count:
-                progress(min(1.0, stats["seen"] / max(1, count)))
-        if target_tag_id:
-            # Queue membership shrinks as status tags are replaced. Re-read page 1
-            # so changing pagination cannot skip scenes.
-            if dry_run:
+            progress(stats["seen"] / max(1, min(len(queued), limit or len(queued))))
+    else:
+        page = 1
+        stop = False
+        while not stop:
+            count, scenes = stash.find_scenes(page, per_page)
+            if not scenes:
                 break
-            page = 1
-            continue
-        if page * per_page >= count:
-            break
-        page += 1
+            for scene in scenes:
+                statuses = _status_names(scene)
+                if statuses:
+                    continue
+                if limit and stats["seen"] >= limit:
+                    stop = True
+                    break
+                stats["seen"] += 1
+                result = process_scene(
+                    stash,
+                    scene,
+                    settings,
+                    deep=deep,
+                    dry_run=dry_run,
+                    tag_cache=tag_cache,
+                    performer_cache=performer_cache,
+                    studio_cache=studio_cache,
+                )
+                stats[result] = stats.get(result, 0) + 1
+                if limit:
+                    progress(stats["seen"] / max(1, limit))
+                elif count:
+                    progress(min(1.0, stats["seen"] / max(1, count)))
+            if page * per_page >= count:
+                break
+            page += 1
 
     return stats
 
