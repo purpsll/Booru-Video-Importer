@@ -264,6 +264,77 @@ _PHASH_BASIS = [
 ]
 
 
+def _compact_ffmpeg_error(stderr: bytes) -> str:
+    """Return one concise FFmpeg error line for Stash logging."""
+    text = stderr.decode("utf-8", errors="replace")
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "perceptual hash frame extraction failed"
+    # The final line is usually the useful terminal decoder error. Avoid
+    # embedding newlines because Stash otherwise renders them as many log rows.
+    return lines[-1][:300]
+
+
+def _phash_frame_raw(
+    source: str,
+    ts: float,
+    ffmpeg_path: str,
+    timeout: int,
+) -> bytes:
+    """Extract one normalized pHash frame with a tolerant exact-time fallback."""
+    vf = (
+        "scale=32:32:force_original_aspect_ratio=decrease,"
+        "pad=32:32:(ow-iw)/2:(oh-ih)/2,format=gray"
+    )
+    expected = _PHASH_SIZE * _PHASH_SIZE
+
+    # Fast input seeking. Some old VP8/WebM files report decode errors after a
+    # usable frame was already emitted, so frame completeness matters more than
+    # FFmpeg's final exit code.
+    fast_cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ts:.3f}", "-i", source,
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    fast = subprocess.run(
+        fast_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    fast_raw = bytes(fast.stdout or b"")
+    if len(fast_raw) >= expected:
+        return fast_raw[:expected]
+
+    # Fallback for malformed/poorly seekable legacy VP8 streams: decode forward
+    # from the beginning with corrupt-packet tolerance, then seek on decoded
+    # output. This is slower but only runs when normal random access failed.
+    tolerant_cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-fflags", "+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-i", source,
+        "-ss", f"{ts:.3f}",
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    tolerant = subprocess.run(
+        tolerant_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=max(timeout, 120),
+        check=False,
+    )
+    tolerant_raw = bytes(tolerant.stdout or b"")
+    if len(tolerant_raw) >= expected:
+        return tolerant_raw[:expected]
+
+    detail = _compact_ffmpeg_error(tolerant.stderr or fast.stderr)
+    raise RuntimeError(detail)
+
+
 def frame_phash(
     source: str,
     duration: float,
@@ -273,30 +344,7 @@ def frame_phash(
 ) -> int:
     """Return a standard 64-bit DCT perceptual hash for one video frame."""
     ts = _timestamp(duration, ratio)
-    vf = (
-        "scale=32:32:force_original_aspect_ratio=decrease,"
-        "pad=32:32:(ow-iw)/2:(oh-ih)/2,format=gray"
-    )
-    cmd = [
-        ffmpeg_path, "-hide_banner", "-loglevel", "error",
-        "-ss", f"{ts:.3f}", "-i", source,
-        "-frames:v", "1", "-vf", vf,
-        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
-    ]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
-    raw = bytes(proc.stdout or b"")
-    expected = _PHASH_SIZE * _PHASH_SIZE
-    if proc.returncode != 0 or len(raw) < expected:
-        raise RuntimeError(
-            proc.stderr.decode("utf-8", errors="replace")[:300]
-            or "perceptual hash frame extraction failed"
-        )
+    raw = _phash_frame_raw(source, ts, ffmpeg_path, timeout)
 
     # Separable 2-D DCT, limited to the 8x8 low-frequency coefficients used
     # by pHash. Scaling constants are irrelevant because the final operation
