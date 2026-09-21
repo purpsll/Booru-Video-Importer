@@ -108,7 +108,7 @@ class Stash:
     @staticmethod
     def _scene_fields() -> str:
         return """
-          id title details date urls
+          id title details date urls organized
           tags { id name }
           studio { id name }
           performers { id name }
