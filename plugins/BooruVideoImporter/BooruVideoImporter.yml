@@ -1,6 +1,6 @@
 name: Booru Video Importer
 description: Matches Stash videos against a persistent local SQLite catalog of e621 WebM/MP4 metadata, exact durations, MD5s, sampled timecodes, and perceptual frame hashes. Exact MD5 matches import immediately; other matches use exact duration, local pHash comparison, and one live same-timecode midpoint verification.
-version: 3.0.0
+version: 3.0.1
 
 exec:
   - python
