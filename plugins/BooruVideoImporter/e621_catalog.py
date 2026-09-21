@@ -6,8 +6,16 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+_PLUGIN_DIR = os.path.dirname(__file__)
+_PLUGINS_DIR = os.path.dirname(_PLUGIN_DIR)
+_STASH_CONFIG_DIR = (
+    os.path.dirname(_PLUGINS_DIR)
+    if os.path.basename(_PLUGINS_DIR).casefold() == "plugins"
+    else _PLUGIN_DIR
+)
+DEFAULT_DATA_DIR = os.path.join(_STASH_CONFIG_DIR, "booru-video-importer")
 DEFAULT_CATALOG_PATH = os.path.join(
-    os.path.dirname(__file__),
+    DEFAULT_DATA_DIR,
     "e621_video_catalog.sqlite",
 )
 HASH_VERSION = 1
