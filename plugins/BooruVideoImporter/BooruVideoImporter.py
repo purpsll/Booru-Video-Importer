@@ -39,7 +39,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -65,9 +65,10 @@ MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
 VERIFY_FRAME_DISTANCE = 24
+SOURCE_FIRST_VERIFY_FRAME_DISTANCE = 16
 E621_SOURCE_PAGE_SIZE = 75
 E621_SOURCE_MAX_CANDIDATES = 5
-E621_SOURCE_EARLY_DISTANCE = 6
+E621_SOURCE_EARLY_DISTANCE = 4
 
 _LAST_E621_REQUEST = 0.0
 _LAST_E621_ERIS = 0.0
@@ -691,6 +692,22 @@ def post_metadata(source: str, post: Dict[str, Any], settings: Dict[str, Any]) -
     }
 
 
+def configured_stash_tag_scope(settings: Dict[str, Any]) -> str:
+    value = settings.get("stash_tag_scope")
+    if value in (None, ""):
+        value = settings.get("stash_source_tag_filter")
+    return " ".join(str(value or "").split())
+
+
+def scene_has_tag_id(scene: Dict[str, Any], tag_id: Optional[str]) -> bool:
+    if not tag_id:
+        return True
+    return any(
+        str(tag.get("id") or "") == str(tag_id)
+        for tag in scene.get("tags") or []
+    )
+
+
 def skip_organized_enabled(settings: Dict[str, Any]) -> bool:
     return as_bool(settings.get("skip_organized_scenes"), False)
 
@@ -951,6 +968,22 @@ def discover_candidates(
 
 
 
+def resolve_stash_tag_filter(
+    stash: Stash,
+    tag_name: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a Stash tag name or alias to its canonical tag ID/name."""
+    tag_name = " ".join(str(tag_name or "").split())
+    if not tag_name:
+        return None, None
+
+    tags = stash.all_tags()
+    tag = tags.get(tag_name.casefold())
+    if not tag:
+        return None, None
+    return str(tag.get("id") or ""), str(tag.get("name") or tag_name)
+
+
 def build_local_source_index(
     stash: Stash,
     settings: Dict[str, Any],
@@ -959,6 +992,23 @@ def build_local_source_index(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Build or refresh the cached early-frame index for eligible local scenes."""
     ffmpeg_path = stash.ffmpeg_path()
+    stash_tag_filter = configured_stash_tag_scope(settings)
+    filter_tag_id: Optional[str] = None
+    filter_tag_name: Optional[str] = None
+    if stash_tag_filter:
+        filter_tag_id, filter_tag_name = resolve_stash_tag_filter(
+            stash,
+            stash_tag_filter,
+        )
+        if not filter_tag_id:
+            raise RuntimeError(
+                f"Stash tag filter not found: {stash_tag_filter}"
+            )
+        log(
+            "INFO",
+            f"Local source-first scope: Stash tag '{filter_tag_name}'",
+        )
+
     cache = load_cache()
     cached = cache.setdefault("scenes", {})
     if not isinstance(cached, dict):
@@ -979,7 +1029,11 @@ def build_local_source_index(
     page = 1
     per_page = 100
     while True:
-        count, scenes = stash.find_scenes(page, per_page)
+        count, scenes = stash.find_scenes(
+            page,
+            per_page,
+            tag_id=filter_tag_id,
+        )
         if not scenes:
             break
 
@@ -1081,7 +1135,9 @@ def build_local_source_index(
     log(
         "INFO",
         "Local source-first index: "
-        f"{len(rows)} eligible; {stats['indexed']} built; {stats['reused']} reused; "
+        f"{len(rows)} eligible"
+        + (f" with Stash tag '{filter_tag_name}'" if filter_tag_name else "")
+        + f"; {stats['indexed']} built; {stats['reused']} reused; "
         f"{stats['skipped_organized']} organized protected; {stats['errors']} errors",
     )
     return rows, stats
@@ -1143,7 +1199,7 @@ def source_first_local_candidates(
         # Stash scene must be close in duration before an early visual hit can
         # become a full-video candidate. This prevents generic-looking clips from
         # reaching verification on frame similarity alone.
-        if duration_delta > 0.15:
+        if duration_delta > 0.03:
             continue
 
         rank = (
@@ -1169,7 +1225,10 @@ def source_first_e621(
     configured_pages = as_int(settings.get("e621_source_pages"), 5)
     duration_tolerance = max(
         0.0,
-        as_float(settings.get("source_first_duration_tolerance_seconds"), 2.0),
+        as_float(settings.get("source_first_duration_tolerance_seconds"), 1.0),
+    )
+    stash_tag_filter = " ".join(
+        str(settings.get("stash_source_tag_filter") or "").split()
     )
     source_pages = max(
         1,
@@ -1340,12 +1399,13 @@ def source_first_e621(
                         remote_url,
                         ffmpeg_path=ffmpeg_path,
                         ratios=DEFAULT_RATIOS,
-                        frame_distance=VERIFY_FRAME_DISTANCE,
+                        frame_distance=SOURCE_FIRST_VERIFY_FRAME_DISTANCE,
                         timeout=60,
                         local_duration=float(entry["duration"]),
                         local_hashes=local_full_hashes,
                         remote_duration=remote_duration,
                         remote_hashes=remote_full_hashes,
+                        strict=True,
                     )
                 except Exception as exc:
                     stats["provider_errors"] += 1
@@ -1632,6 +1692,17 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
     performer_cache = stash.all_performers()
     studio_cache = stash.all_studios()
 
+    scope_name = configured_stash_tag_scope(settings)
+    scope_tag_id: Optional[str] = None
+    scope_canonical_name: Optional[str] = None
+    if scope_name:
+        scope_tag = tag_cache.get(scope_name.casefold())
+        if not scope_tag:
+            raise RuntimeError(f"Stash tag scope not found: {scope_name}")
+        scope_tag_id = str(scope_tag.get("id") or "")
+        scope_canonical_name = str(scope_tag.get("name") or scope_name)
+        log("INFO", f"Video tagger scope: Stash tag '{scope_canonical_name}'")
+
     target_tag_id: Optional[str] = None
     if only_review:
         tag = ensure_tag(stash, STATUS_REVIEW, tag_cache)
@@ -1664,8 +1735,14 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         page = 1
         while True:
             count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
+            had_page_rows = bool(scenes)
+            if scope_tag_id:
+                scenes = [
+                    scene for scene in scenes
+                    if scene_has_tag_id(scene, scope_tag_id)
+                ]
             queued.extend(scenes)
-            if page * per_page >= count or not scenes:
+            if page * per_page >= count or not had_page_rows:
                 break
             page += 1
 
@@ -1689,7 +1766,11 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         page = 1
         stop = False
         while not stop:
-            count, scenes = stash.find_scenes(page, per_page)
+            count, scenes = stash.find_scenes(
+                page,
+                per_page,
+                tag_id=scope_tag_id,
+            )
             if not scenes:
                 break
             for scene in scenes:

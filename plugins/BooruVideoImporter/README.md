@@ -81,7 +81,15 @@ Creates or refreshes the cached early-frame hashes used by source-first matching
 Tests recent e621 WebM/MP4 posts against the local frame index without changing Stash.
 
 **8. Match e621 Videos to Local Stash**  
-Scans e621 video posts, finds likely local scenes by early-frame hashes, verifies the actual videos across multiple frames, and imports authoritative e621 metadata for verified matches.
+Scans e621 video posts against only the currently selected Stash Tag Scope (or all eligible videos when blank). Duration is filtered first, then two aligned early frames must agree, followed by ultra-strict seven-point aligned verification.
+
+## Dynamic Stash Tag Scope
+
+Set **Stash Tag Scope (any tag or alias)** to any existing Stash tag name or alias. For example, entering `furry` limits the tagger to local video scenes that already carry that tag.
+
+The tag is resolved live from your Stash database, so there is no hardcoded tag list. Custom tags and tags created later work automatically. Leave the field blank to process all eligible videos.
+
+The scope applies across Fast Scan, Deep Scan, Review/Retry processing, local frame indexing, and e621 source-first matching.
 
 ## Settings
 
