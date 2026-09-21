@@ -132,23 +132,25 @@ def early_frame_hashes(
     duration = max(0.1, float(duration))
     first_seconds = min(1.0, max(0.05, duration * 0.02))
     second_ratio = 0.10
-    values = [
+    return [
         frame_ahash_at_seconds(source, first_seconds, ffmpeg_path, timeout),
         frame_ahash(source, duration, second_ratio, ffmpeg_path, timeout),
     ]
-    # Keep stable order but avoid duplicate hashes on very short/static videos.
-    return list(dict.fromkeys(values))
 
 
 def early_hash_candidate(
     local_hashes: Iterable[int],
     remote_hashes: Iterable[int],
-    max_distance: int = 10,
+    max_distance: int = 6,
 ) -> Dict[str, object]:
-    """Score a cheap two-frame source-first candidate before full verification."""
+    """Require two aligned early-frame hashes before expensive verification.
+
+    Source-first matching is intentionally conservative. A single visually similar
+    frame is never enough to nominate a local scene.
+    """
     local = [int(x) for x in local_hashes]
     remote = [int(x) for x in remote_hashes]
-    if not local or not remote:
+    if len(local) < 2 or len(remote) < 2:
         return {
             "candidate": False,
             "matched": 0,
@@ -157,22 +159,22 @@ def early_hash_candidate(
             "distances": [],
         }
 
-    nearest = [min(hamming_distance(r, l) for l in local) for r in remote]
-    matched = sum(1 for d in nearest if d <= max_distance)
-    median = float(statistics.median(nearest)) if nearest else 64.0
-    minimum = min(nearest) if nearest else 64
+    distances = [
+        hamming_distance(local[index], remote[index])
+        for index in range(min(len(local), len(remote), 2))
+    ]
+    matched = sum(1 for distance in distances if distance <= max_distance)
+    median = float(statistics.median(distances)) if distances else 64.0
+    minimum = min(distances) if distances else 64
 
-    # Two agreeing early hashes are strong enough to justify expensive full-video
-    # verification. One near-identical hash is also allowed as a candidate because
-    # a short intro/trim can move the second sample.
-    candidate = matched >= min(2, len(remote)) or minimum <= 4
     return {
-        "candidate": candidate,
+        "candidate": len(distances) == 2 and matched == 2,
         "matched": matched,
         "min_distance": minimum,
         "median_distance": round(median, 2),
-        "distances": nearest,
+        "distances": distances,
     }
+
 
 
 def frame_ahash(
@@ -203,6 +205,48 @@ def frame_ahash(
     return value
 
 
+def frame_dhash(
+    source: str,
+    duration: float,
+    ratio: float,
+    ffmpeg_path: str = "ffmpeg",
+    timeout: int = 30,
+) -> int:
+    """Return a 256-bit horizontal difference hash from a normalized frame."""
+    ts = _timestamp(duration, ratio)
+    vf = "scale=17:16:force_original_aspect_ratio=decrease,pad=17:16:(ow-iw)/2:(oh-ih)/2,format=gray"
+    cmd = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ts:.3f}", "-i", source,
+        "-frames:v", "1", "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    raw = bytes(proc.stdout or b"")
+    if proc.returncode != 0 or len(raw) < 272:
+        raise RuntimeError(
+            proc.stderr.decode("utf-8", errors="replace")[:300]
+            or "strong perceptual frame extraction failed"
+        )
+
+    pixels = raw[:272]
+    value = 0
+    for row in range(16):
+        offset = row * 17
+        for col in range(16):
+            left = pixels[offset + col]
+            right = pixels[offset + col + 1]
+            value = (value << 1) | (1 if left >= right else 0)
+    return value
+
+
+
 def hamming_distance(a: int, b: int) -> int:
     return (int(a) ^ int(b)).bit_count()
 
@@ -214,7 +258,7 @@ def frame_hashes(
     ratios: Iterable[float] = DEFAULT_RATIOS,
     timeout: int = 30,
 ) -> List[int]:
-    return [frame_ahash(source, duration, ratio, ffmpeg_path, timeout) for ratio in ratios]
+    return [frame_dhash(source, duration, ratio, ffmpeg_path, timeout) for ratio in ratios]
 
 
 def verify_video_candidate(
@@ -222,45 +266,72 @@ def verify_video_candidate(
     remote_source: str,
     ffmpeg_path: str = "ffmpeg",
     ratios: Iterable[float] = DEFAULT_RATIOS,
-    frame_distance: int = 8,
+    frame_distance: int = 24,
     timeout: int = 45,
     local_duration: float | None = None,
     local_hashes: List[int] | None = None,
     remote_duration: float | None = None,
     remote_hashes: List[int] | None = None,
 ) -> Dict[str, object]:
-    """Compare several perceptual frames while tolerating modest trim/timing shifts.
+    """Verify videos using temporally aligned 256-bit frame hashes.
 
-    Each local frame is compared against every candidate frame. This is more tolerant
-    of intros/outros and small timing offsets than strict same-timestamp matching.
+    Frames are compared only at the same relative positions. This intentionally
+    favors false negatives over false positives; unrelated videos must not pass
+    merely because they contain visually similar frames in different places.
     """
     ratios = tuple(ratios)
     local_duration = local_duration or probe_duration(local_source, ffmpeg_path, timeout)
     remote_duration = remote_duration or probe_duration(remote_source, ffmpeg_path, timeout)
-    local_hashes = local_hashes or frame_hashes(local_source, local_duration, ffmpeg_path, ratios, timeout)
-    remote_hashes = remote_hashes or frame_hashes(remote_source, remote_duration, ffmpeg_path, ratios, timeout)
+    local_hashes = local_hashes or frame_hashes(
+        local_source, local_duration, ffmpeg_path, ratios, timeout
+    )
+    remote_hashes = remote_hashes or frame_hashes(
+        remote_source, remote_duration, ffmpeg_path, ratios, timeout
+    )
 
-    nearest: List[int] = []
-    for local_hash in local_hashes:
-        nearest.append(min(hamming_distance(local_hash, candidate) for candidate in remote_hashes))
+    pair_count = min(len(local_hashes), len(remote_hashes), len(ratios))
+    aligned = [
+        hamming_distance(local_hashes[index], remote_hashes[index])
+        for index in range(pair_count)
+    ]
 
-    matched = sum(1 for distance in nearest if distance <= frame_distance)
-    median = float(statistics.median(nearest)) if nearest else 64.0
-    mean = float(sum(nearest) / len(nearest)) if nearest else 64.0
+    matched = sum(1 for distance in aligned if distance <= frame_distance)
+    median = float(statistics.median(aligned)) if aligned else 256.0
+    mean = float(sum(aligned) / len(aligned)) if aligned else 256.0
+    duration_delta = (
+        abs(float(local_duration) - float(remote_duration))
+        / max(float(local_duration), float(remote_duration))
+        if local_duration and remote_duration
+        else 1.0
+    )
 
-    # High confidence requires agreement across most of the sampled video.
-    high = matched >= max(4, len(nearest) - 2) and median <= frame_distance
-    # Borderline candidates are surfaced for Review, never auto-imported.
-    review = not high and matched >= 3 and median <= frame_distance + 4
+    required_high = max(6, pair_count - 1)
+    high = (
+        pair_count >= 6
+        and matched >= required_high
+        and median <= 18.0
+        and duration_delta <= 0.08
+    )
+    review = (
+        not high
+        and pair_count >= 6
+        and matched >= 5
+        and median <= 26.0
+        and duration_delta <= 0.15
+    )
 
     return {
         "high": high,
         "review": review,
         "matched_frames": matched,
-        "total_frames": len(nearest),
+        "total_frames": pair_count,
         "median_distance": round(median, 2),
         "mean_distance": round(mean, 2),
-        "nearest_distances": nearest,
+        "aligned_distances": aligned,
+        # Compatibility key retained for existing logging/callers.
+        "nearest_distances": aligned,
+        "duration_delta": round(duration_delta, 4),
         "local_duration": round(float(local_duration), 3),
         "remote_duration": round(float(remote_duration), 3),
     }
+
