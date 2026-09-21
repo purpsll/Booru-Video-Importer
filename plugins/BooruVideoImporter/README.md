@@ -16,13 +16,13 @@ The importer processes one eligible Stash video at a time:
 2. If the MD5 matches an e621 video, import immediately and move to the next local file.
 3. If MD5 does not match, get the local video's duration and normalize it to integer milliseconds.
 4. Walk e621 WebM video history from newest to oldest.
-4. Skip posts with missing duration.
-5. Skip every video whose duration is not exactly equal to the local duration.
-6. For each exact-duration candidate, extract frames from the local and remote videos at the same timecodes.
-7. If the frames do not match, continue to the next exact-duration e621 video.
-8. If the candidate passes strict aligned verification, import all supported e621 metadata and stop searching for that local file.
-9. If WebM history is exhausted, repeat through MP4 history.
-10. If both histories are exhausted with no verified match, move to the next local Stash video and begin again from newest.
+5. Skip posts with missing duration.
+6. Skip every video whose duration is not exactly equal to the local duration.
+7. For each exact-duration candidate, extract frames from the local and remote videos at the same timecodes.
+8. If the frames do not match, continue to the next exact-duration e621 video.
+9. If the candidate passes strict aligned verification, import all supported e621 metadata and stop searching for that local file.
+10. If WebM history is exhausted, repeat through MP4 history.
+11. If both histories are exhausted with no verified match, move to the next local Stash video and begin again from newest.
 
 ## Why exact duration is first
 
@@ -103,7 +103,7 @@ Resets the current Stash Tag Scope to the first eligible local video and newest 
 
 The rebuilt importer no longer includes:
 
-- Fast MD5 scan;
+- the old separate Fast MD5 task (MD5 is now an internal first-stage optimization);
 - Deep Reverse Search;
 - SauceNAO;
 - e621 ERIS reverse-image search;
