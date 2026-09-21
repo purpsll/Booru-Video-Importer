@@ -6,7 +6,7 @@ import os
 import tempfile
 from typing import Any, Dict
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "booru_video_hash_index.json")
 
 
