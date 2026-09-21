@@ -50,6 +50,9 @@ class E621VideoCatalog:
                     url TEXT NOT NULL,
                     md5 TEXT,
                     updated_at TEXT,
+                    time_10_ms INTEGER,
+                    time_50_ms INTEGER,
+                    time_90_ms INTEGER,
                     phash_10 TEXT,
                     phash_50 TEXT,
                     phash_90 TEXT,
@@ -65,6 +68,9 @@ class E621VideoCatalog:
                 for row in conn.execute("PRAGMA table_info(videos)").fetchall()
             }
             migrations = {
+                "time_10_ms": "INTEGER",
+                "time_50_ms": "INTEGER",
+                "time_90_ms": "INTEGER",
                 "phash_10": "TEXT",
                 "phash_50": "TEXT",
                 "phash_90": "TEXT",
@@ -229,16 +235,21 @@ class E621VideoCatalog:
         self,
         post_id: int,
         hashes: Sequence[str],
+        timecodes_ms: Sequence[int],
         hash_version: int = HASH_VERSION,
     ) -> None:
         values = list(hashes)
-        if len(values) != 3:
-            raise ValueError("Exactly three perceptual hashes are required")
+        times = list(timecodes_ms)
+        if len(values) != 3 or len(times) != 3:
+            raise ValueError("Exactly three hashes and three timecodes are required")
         with self._connection() as conn:
             conn.execute(
                 """
                 UPDATE videos
-                SET phash_10 = ?,
+                SET time_10_ms = ?,
+                    time_50_ms = ?,
+                    time_90_ms = ?,
+                    phash_10 = ?,
                     phash_50 = ?,
                     phash_90 = ?,
                     hash_version = ?,
@@ -247,6 +258,9 @@ class E621VideoCatalog:
                 WHERE post_id = ?
                 """,
                 (
+                    int(times[0]),
+                    int(times[1]),
+                    int(times[2]),
                     str(values[0]),
                     str(values[1]),
                     str(values[2]),
@@ -286,6 +300,7 @@ class E621VideoCatalog:
             rows = conn.execute(
                 f"""
                 SELECT post_id, ext, duration_ms, url, md5,
+                       time_10_ms, time_50_ms, time_90_ms,
                        phash_10, phash_50, phash_90,
                        hash_version, hash_error, hash_attempts
                 FROM videos
@@ -304,6 +319,7 @@ class E621VideoCatalog:
             row = conn.execute(
                 """
                 SELECT post_id, ext, duration_ms, url, md5,
+                       time_10_ms, time_50_ms, time_90_ms,
                        phash_10, phash_50, phash_90, hash_version
                 FROM videos
                 WHERE md5 = ?
