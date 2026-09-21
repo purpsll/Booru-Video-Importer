@@ -1,6 +1,6 @@
 name: Booru Video Importer
 description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and e621 source-first matching that compares early video frames against a cached local Stash frame index before full multi-frame verification.
-version: 1.1.1
+version: 1.1.2
 
 exec:
   - python
@@ -14,6 +14,11 @@ settings:
     displayName: Protect Organized Scenes
     description: When enabled, any Stash scene already marked Organized is skipped completely. The plugin will not add tags, performers, studio, URLs, dates, or workflow markers to that scene.
     type: BOOLEAN
+
+  source_first_duration_tolerance_seconds:
+    displayName: Source-First Duration Tolerance (seconds)
+    description: e621 videos are compared only to local Stash scenes within this many seconds of the same duration before any frame hashing is attempted. Default 2.0 seconds.
+    type: NUMBER
 
   source_first_auto_import:
     displayName: Allow Source-First Auto Import
@@ -109,7 +114,7 @@ tasks:
       source_post_limit: 25
 
   - name: 8. Match e621 Videos to Local Stash
-    description: Scans recent e621 WebM/MP4 posts outward, requires two aligned early-frame matches plus close duration, then verifies aligned frames across the full video. High-confidence results go to Review unless Allow Source-First Auto Import is explicitly enabled.
+    description: Scans recent e621 WebM/MP4 posts outward. Duration is checked first; only local scenes within the configured duration tolerance are frame-compared. Candidates still require two aligned early-frame matches and strict full-video verification. High-confidence results go to Review unless Allow Source-First Auto Import is enabled.
     defaultArgs:
       mode: source_first_e621
       dry_run: false
