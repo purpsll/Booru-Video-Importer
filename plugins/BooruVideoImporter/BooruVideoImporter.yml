@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Stash-first e621 video matcher. Checks the exact primary-video MD5 first for an immediate byte-identical match, then falls back to exhaustive exact-duration and same-timecode frame verification when the file has been remuxed or re-encoded.
-version: 2.1.0
+description: Matches Stash videos against a persistent local SQLite catalog of e621 WebM/MP4 metadata, exact durations, MD5s, sampled timecodes, and perceptual frame hashes. Exact MD5 matches import immediately; other matches use exact duration, local pHash comparison, and one live same-timecode midpoint verification.
+version: 3.0.0
 
 exec:
   - python
@@ -12,7 +12,7 @@ errLog: info
 settings:
   stash_tag_scope:
     displayName: Stash Tag Scope (any tag or alias)
-    description: Optional. Enter any existing Stash tag name or alias, for example furry. Only local video scenes carrying that tag are processed. Leave blank to process all eligible local videos.
+    description: Optional. Enter any existing Stash tag name or alias, for example furry. Only local video scenes carrying that tag are matched. Leave blank to process all eligible local videos.
     type: STRING
 
   skip_organized_scenes:
@@ -20,14 +20,9 @@ settings:
     description: When enabled, any Stash scene already marked Organized is skipped completely and no metadata is changed.
     type: BOOLEAN
 
-  e621_pages_per_run:
-    displayName: e621 History Pages per Stash Video per Run
-    description: Set to 0 or leave blank for continuous scanning. Continuous mode keeps scanning the active local Stash video until it finds a verified match or exhausts all e621 WebM + MP4 history, then automatically moves to the next local video. Set a positive number only if you want each run capped to that many e621 pages.
-    type: NUMBER
-
   e621_username:
     displayName: e621 username
-    description: Recommended for authenticated e621 API access.
+    description: Recommended for authenticated e621 API access while building/updating the catalog and fetching verified post metadata.
     type: STRING
 
   e621_api_key:
@@ -36,22 +31,27 @@ settings:
     type: STRING
 
 tasks:
-  - name: Preview Next Stash Video Match (No Changes)
-    description: Takes the next eligible local Stash video and scans a limited e621 history window. Only exact-duration WebM/MP4 posts are opened. Same-timecode frames are compared, but no metadata or progress is changed.
+  - name: 1. Build / Update e621 Video Catalog
+    description: Creates or resumes the persistent SQLite e621 video catalog. Crawls WebM/MP4 posts once, stores post ID, URL, MD5, exact duration and sampled 10/50/90 percent timecodes, and generates three DCT perceptual hashes per video. Later runs continue from saved e621 cursors and add only newer posts while retrying transient hash failures.
+    defaultArgs:
+      mode: catalog
+      page_limit: 0
+      hash_limit: 0
+
+  - name: 2. Show e621 Video Catalog Status
+    description: Reports catalog row count, hashed-video count, failed hashes, duration buckets, and current WebM/MP4 crawl cursors without changing anything.
+    defaultArgs:
+      mode: catalog_status
+
+  - name: 3. Preview Next Stash Video Match (No Changes)
+    description: Tests the next eligible local Stash video against the local e621 catalog. MD5 is checked first, then exact-duration rows and cached pHashes. Only plausible candidates are opened for one same-timecode midpoint-frame verification. Makes no Stash metadata changes.
     defaultArgs:
       mode: match
       dry_run: true
-      pages_per_run: 1
       local_limit: 1
 
-  - name: Match Filtered Stash Videos Against e621
-    description: Main importer. Checks the primary Stash video file's MD5 directly against e621 first; byte-identical files import immediately with no history scan. MD5 misses fall back to the continuous WebM/MP4 history search using exact duration before remote media access and strict same-timecode verification.
+  - name: 4. Match Filtered Stash Videos Against e621 Catalog
+    description: Main importer. Uses the persistent catalog instead of rescanning e621 history for each Stash file. Exact MD5 matches import immediately. Otherwise only exact-duration catalog rows are compared by cached 10/50/90 percent pHashes, and only plausible candidates are fetched for one live midpoint-frame verification before authoritative e621 metadata is imported.
     defaultArgs:
       mode: match
       dry_run: false
-      pages_per_run: 0
-
-  - name: Reset Matching Progress
-    description: Clears saved progress for the current Stash Tag Scope. The next run starts the first eligible local video from the newest e621 WebM history again.
-    defaultArgs:
-      mode: reset
