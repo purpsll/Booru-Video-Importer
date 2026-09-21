@@ -8,17 +8,24 @@ The plugin is intentionally Stash-first: it works on one local video at a time.
 
 For each eligible local Stash video:
 
-1. Read the local video duration and normalize it to integer milliseconds.
-2. Search e621 **video posts only**, first WebM history and then MP4 history, from newest to oldest.
-3. Read e621 post metadata first.
-4. Reject every e621 video whose duration does not exactly match the local video's normalized millisecond duration.
-5. Only for an exact-duration candidate, open the remote video and extract comparison frames.
-6. Compare local and e621 frames at the same timecodes.
-7. If the candidate fails, continue to the next exact-duration e621 video.
-8. On the first strict verified match, import the e621 metadata and move to the next local Stash video.
-9. If all e621 WebM and MP4 history is exhausted without a verified match, move to the next local Stash video.
+1. Read the MD5 fingerprint from the **exact primary Stash video file** being processed.
+2. Ask e621 directly for that MD5. A byte-identical e621 video match imports metadata immediately with no duration crawl or frame extraction.
+3. If MD5 is unavailable or finds no e621 video, read the local duration and normalize it to integer milliseconds.
+4. Search e621 **video posts only**, first WebM history and then MP4 history, from newest to oldest.
+5. Reject every e621 video whose duration does not exactly match the local video's normalized millisecond duration.
+6. Only for an exact-duration candidate, open the remote video and extract comparison frames.
+7. Compare local and e621 frames at the same timecodes.
+8. If the candidate fails, continue to the next exact-duration e621 video.
+9. On the first strict verified match, import the e621 metadata and move to the next local Stash video.
+10. If all e621 WebM and MP4 history is exhausted without a verified match, move to the next local Stash video.
 
 A single similar frame is not enough. Exact-duration candidates must also pass strict aligned multi-frame verification before metadata is written.
+
+## Exact-file MD5 fast path
+
+When the Stash video is byte-for-byte identical to the file hosted by e621, the importer uses a direct e621 MD5 lookup first. This is definitive and avoids the historical scan entirely.
+
+The fingerprint is read from the same primary Stash file being processed, so another file attached to a multi-file scene cannot supply the MD5 accidentally. If no MD5 is available or e621 has no exact-file match, the importer automatically falls back to the exhaustive duration/frame workflow.
 
 ## Efficient local frame cache
 
