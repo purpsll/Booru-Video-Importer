@@ -264,5 +264,54 @@ class VideoMatchTests(unittest.TestCase):
         self.assertEqual(rows[0][1]["scene_id"], "1")
 
 
+    def test_permuted_frames_do_not_pass_aligned_verification(self):
+        patterns = [
+            int.from_bytes(bytes([value]) * 32, "big")
+            for value in (0x00, 0x0F, 0x33, 0x55, 0xAA, 0xCC, 0xFF)
+        ]
+        result = video_match.verify_video_candidate(
+            "local.mp4",
+            "remote.mp4",
+            local_duration=100.0,
+            remote_duration=100.0,
+            local_hashes=patterns,
+            remote_hashes=list(reversed(patterns)),
+            frame_distance=24,
+        )
+
+        self.assertFalse(result["high"])
+        self.assertFalse(result["review"])
+        self.assertLess(result["matched_frames"], 5)
+
+    def test_single_early_frame_is_never_a_candidate(self):
+        result = video_match.early_hash_candidate(
+            [0x0000000000000000],
+            [0x0000000000000000],
+            max_distance=6,
+        )
+        self.assertFalse(result["candidate"])
+        self.assertEqual(result["matched"], 0)
+
+    def test_two_early_frames_must_match_same_positions(self):
+        local = [0x0000000000000000, 0xFFFFFFFFFFFFFFFF]
+        remote = [0xFFFFFFFFFFFFFFFF, 0x0000000000000000]
+        result = video_match.early_hash_candidate(local, remote, max_distance=6)
+        self.assertFalse(result["candidate"])
+
+
+    def test_source_first_rejects_large_duration_mismatch(self):
+        local_index = [{
+            "scene_id": "1",
+            "duration": 100.0,
+            "hashes": [0x0000, 0x000F],
+        }]
+        rows = plugin.source_first_local_candidates(
+            local_index,
+            [0x0001, 0x000E],
+            60.0,
+        )
+        self.assertEqual(rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()

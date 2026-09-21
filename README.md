@@ -54,6 +54,8 @@ For e621 source-first matching:
 
 The local frame index is cached and unchanged files reuse their hashes on later runs.
 
+Source-first matching is intentionally strict: both early frames must match at the same positions, durations must be close, and final verification compares stronger 256-bit perceptual hashes at aligned timestamps. **Allow Source-First Auto Import** is off by default, so verified source-first results go to Review until you explicitly enable automatic metadata writes.
+
 The plugin uses its own status tags and does not share queues with the image Booru Importer.
 
 ## Credentials
