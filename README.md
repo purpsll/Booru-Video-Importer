@@ -97,9 +97,9 @@ Clears saved progress for the currently selected Stash Tag Scope. The next run s
 
 ### e621 History Pages per Stash Video per Run
 
-Controls how many e621 history pages are processed for the current local file before progress is saved.
+Set this to **0** or leave it blank for continuous scanning. In continuous mode, the importer keeps the active local Stash video and scans until it either finds a strict verified e621 match or exhausts all WebM + MP4 video history. It then automatically starts the next eligible local video.
 
-The default is 10 pages. A later run resumes the same local file automatically.
+Set a positive number only when you intentionally want to cap a run to that many e621 pages. If a capped or interrupted run stops early, saved progress resumes the same local file safely on the next run.
 
 ### e621 credentials
 
