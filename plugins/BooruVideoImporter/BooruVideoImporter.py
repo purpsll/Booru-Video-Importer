@@ -1255,7 +1255,11 @@ def source_first_local_candidates(
         Tuple[Tuple[float, float, float], Dict[str, Any], Dict[str, object]]
     ] = []
 
+    remote_duration_ms = duration_milliseconds(remote_duration)
     for entry in local_index:
+        if duration_milliseconds(entry.get("duration")) != remote_duration_ms:
+            continue
+
         early = early_hash_candidate(
             entry.get("hashes") or [],
             remote_hashes,
