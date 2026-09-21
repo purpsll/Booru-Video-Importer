@@ -6,10 +6,18 @@ import os
 import tempfile
 from typing import Any, Dict
 
-CACHE_VERSION = 2
-SCAN_STATE_VERSION = 2
-DEFAULT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "booru_video_hash_index.json")
-DEFAULT_SCAN_STATE_PATH = os.path.join(os.path.dirname(__file__), "booru_video_scan_state.json")
+CACHE_VERSION = 3
+SCAN_STATE_VERSION = 3
+_PLUGIN_DIR = os.path.dirname(__file__)
+_PLUGINS_DIR = os.path.dirname(_PLUGIN_DIR)
+_STASH_CONFIG_DIR = (
+    os.path.dirname(_PLUGINS_DIR)
+    if os.path.basename(_PLUGINS_DIR).casefold() == "plugins"
+    else _PLUGIN_DIR
+)
+DEFAULT_DATA_DIR = os.path.join(_STASH_CONFIG_DIR, "booru-video-importer")
+DEFAULT_CACHE_PATH = os.path.join(DEFAULT_DATA_DIR, "booru_video_hash_index.json")
+DEFAULT_SCAN_STATE_PATH = os.path.join(DEFAULT_DATA_DIR, "booru_video_scan_state.json")
 
 
 def load_cache(path: str = DEFAULT_CACHE_PATH) -> Dict[str, Any]:
