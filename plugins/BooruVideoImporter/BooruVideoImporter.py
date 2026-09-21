@@ -693,7 +693,10 @@ def post_metadata(source: str, post: Dict[str, Any], settings: Dict[str, Any]) -
 
 
 def configured_stash_tag_scope(settings: Dict[str, Any]) -> str:
-    return " ".join(str(settings.get("stash_source_tag_filter") or "").split())
+    value = settings.get("stash_tag_scope")
+    if value in (None, ""):
+        value = settings.get("stash_source_tag_filter")
+    return " ".join(str(value or "").split())
 
 
 def scene_has_tag_id(scene: Dict[str, Any], tag_id: Optional[str]) -> bool:
@@ -989,9 +992,7 @@ def build_local_source_index(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Build or refresh the cached early-frame index for eligible local scenes."""
     ffmpeg_path = stash.ffmpeg_path()
-    stash_tag_filter = " ".join(
-        str(settings.get("stash_source_tag_filter") or "").split()
-    )
+    stash_tag_filter = configured_stash_tag_scope(settings)
     filter_tag_id: Optional[str] = None
     filter_tag_name: Optional[str] = None
     if stash_tag_filter:
