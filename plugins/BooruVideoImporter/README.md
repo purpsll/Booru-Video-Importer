@@ -34,6 +34,10 @@ The plugin maintains an internal lazy frame-hash cache for Stash videos.
 
 There is no manual index task. The cache is created only when a local video is actually processed, and unchanged files reuse cached hashes.
 
+## Continuous scanning
+
+The main matching task defaults to continuous mode. There is no plugin-level maximum page count in continuous mode.
+
 ## Saved progress
 
 A complete e621-history search may span multiple plugin runs.
