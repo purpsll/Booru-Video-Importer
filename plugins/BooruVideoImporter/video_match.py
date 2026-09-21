@@ -272,6 +272,7 @@ def verify_video_candidate(
     local_hashes: List[int] | None = None,
     remote_duration: float | None = None,
     remote_hashes: List[int] | None = None,
+    strict: bool = False,
 ) -> Dict[str, object]:
     """Verify videos using temporally aligned 256-bit frame hashes.
 
@@ -305,23 +306,39 @@ def verify_video_candidate(
         else 1.0
     )
 
-    # Source-first verification intentionally favors false negatives. A high
-    # confidence result requires every sampled timestamp to agree closely and the
-    # files to have nearly identical runtime.
-    high = (
-        pair_count >= 7
-        and matched == pair_count
-        and median <= 10.0
-        and max(aligned, default=256) <= frame_distance
-        and duration_delta <= 0.02
-    )
-    review = (
-        not high
-        and pair_count >= 7
-        and matched >= pair_count - 1
-        and median <= 16.0
-        and duration_delta <= 0.05
-    )
+    if strict:
+        # Source-first verification intentionally favors false negatives. A high
+        # confidence result requires every sampled timestamp to agree closely and
+        # the files to have nearly identical runtime.
+        high = (
+            pair_count >= 7
+            and matched == pair_count
+            and median <= 10.0
+            and max(aligned, default=256) <= frame_distance
+            and duration_delta <= 0.02
+        )
+        review = (
+            not high
+            and pair_count >= 7
+            and matched >= pair_count - 1
+            and median <= 16.0
+            and duration_delta <= 0.05
+        )
+    else:
+        required_high = max(6, pair_count - 1)
+        high = (
+            pair_count >= 6
+            and matched >= required_high
+            and median <= 18.0
+            and duration_delta <= 0.08
+        )
+        review = (
+            not high
+            and pair_count >= 6
+            and matched >= 5
+            and median <= 26.0
+            and duration_delta <= 0.15
+        )
 
     return {
         "high": high,
