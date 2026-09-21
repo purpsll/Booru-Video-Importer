@@ -113,7 +113,7 @@ class Stash:
           studio { id name }
           performers { id name }
           files {
-            id path basename format duration
+            id path basename format duration size mod_time
             fingerprints { type value }
           }
         """
