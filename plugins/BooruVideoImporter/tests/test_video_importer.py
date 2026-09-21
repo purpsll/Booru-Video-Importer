@@ -5,6 +5,8 @@ import unittest
 from unittest import mock
 import sys
 
+import video_match
+
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parents[1]
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
@@ -398,6 +400,84 @@ class BooruVideoImporterTests(unittest.TestCase):
         self.assertIn("artist_two", metadata["tags"])
         self.assertEqual(metadata["date"], "2026-09-01")
         self.assertIn("https://e621.net/posts/123", metadata["urls"])
+
+
+    def test_phash_accepts_complete_frame_even_if_ffmpeg_exits_nonzero(self):
+        complete = bytes([128]) * (32 * 32)
+        proc = mock.Mock(
+            returncode=1,
+            stdout=complete,
+            stderr=b"Decoding error: Invalid data found when processing input\n",
+        )
+        with mock.patch.object(video_match.subprocess, "run", return_value=proc) as run:
+            value = video_match.frame_phash(
+                "https://example/video.webm",
+                60.0,
+                0.5,
+                ffmpeg_path="ffmpeg",
+                timeout=10,
+            )
+        self.assertIsInstance(value, int)
+        self.assertEqual(run.call_count, 1)
+
+    def test_phash_falls_back_to_tolerant_decode_when_fast_seek_fails(self):
+        failed = mock.Mock(
+            returncode=1,
+            stdout=b"",
+            stderr=b"[dec:vp8] Invalid data found when processing input\n",
+        )
+        complete = bytes([64]) * (32 * 32)
+        recovered = mock.Mock(
+            returncode=0,
+            stdout=complete,
+            stderr=b"",
+        )
+        with mock.patch.object(
+            video_match.subprocess,
+            "run",
+            side_effect=[failed, recovered],
+        ) as run:
+            value = video_match.frame_phash(
+                "https://example/video.webm",
+                60.0,
+                0.5,
+                ffmpeg_path="ffmpeg",
+                timeout=10,
+            )
+        self.assertIsInstance(value, int)
+        self.assertEqual(run.call_count, 2)
+        tolerant_cmd = run.call_args_list[1].args[0]
+        self.assertIn("ignore_err", tolerant_cmd)
+        self.assertIn("+discardcorrupt", tolerant_cmd)
+        self.assertLess(tolerant_cmd.index("-i"), tolerant_cmd.index("-ss"))
+
+    def test_phash_failure_error_is_single_line(self):
+        failed_fast = mock.Mock(
+            returncode=1,
+            stdout=b"",
+            stderr=b"line one\nline two\n",
+        )
+        failed_tolerant = mock.Mock(
+            returncode=1,
+            stdout=b"",
+            stderr=b"decoder detail\nInvalid data found when processing input\n",
+        )
+        with mock.patch.object(
+            video_match.subprocess,
+            "run",
+            side_effect=[failed_fast, failed_tolerant],
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                video_match.frame_phash(
+                    "https://example/video.webm",
+                    60.0,
+                    0.5,
+                    ffmpeg_path="ffmpeg",
+                    timeout=10,
+                )
+        message = str(caught.exception)
+        self.assertNotIn("\n", message)
+        self.assertIn("Invalid data found when processing input", message)
 
 
 if __name__ == "__main__":
