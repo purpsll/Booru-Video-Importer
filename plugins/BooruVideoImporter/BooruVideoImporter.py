@@ -40,7 +40,7 @@ from video_match import (
     probe_duration,
 )
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 E621_BASE = "https://e621.net"
 E621_PAGE_SIZE = 75
 VIDEO_EXTENSIONS = ("webm", "mp4")
