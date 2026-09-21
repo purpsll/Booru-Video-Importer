@@ -2,13 +2,20 @@
 
 A focused Stash video importer that matches local videos against **e621 video history**.
 
+## Exact-file MD5 first
+
+Before any duration crawl or frame extraction, the importer reads the MD5 fingerprint from the exact primary Stash video file and asks e621 directly for that MD5.
+
+A returned e621 video with the identical MD5 is a byte-for-byte file match, so metadata is imported immediately. If there is no MD5 fingerprint, the lookup fails, or e621 has no exact-file match, the same task automatically continues with the exhaustive duration/frame workflow.
+
 ## Primary workflow
 
 The importer processes one eligible Stash video at a time:
 
-1. Get the local video's duration.
-2. Normalize it to integer milliseconds.
-3. Walk e621 WebM video history from newest to oldest.
+1. Check the primary local video's MD5 directly against e621.
+2. If the MD5 matches an e621 video, import immediately and move to the next local file.
+3. If MD5 does not match, get the local video's duration and normalize it to integer milliseconds.
+4. Walk e621 WebM video history from newest to oldest.
 4. Skip posts with missing duration.
 5. Skip every video whose duration is not exactly equal to the local duration.
 6. For each exact-duration candidate, extract frames from the local and remote videos at the same timecodes.
