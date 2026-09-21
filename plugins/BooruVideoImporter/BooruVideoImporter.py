@@ -39,7 +39,7 @@ from video_match import (
     verify_video_candidate,
 )
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 USER_AGENT = f"stash-booru-video-importer/{VERSION}"
 
 E621_BASE = "https://e621.net"
@@ -64,10 +64,10 @@ DISCOVERY_RATIOS = (0.12, 0.32, 0.52, 0.72, 0.88)
 MAX_CANDIDATES = 8
 E621_ERIS_DISCOVERY_SCORE = 60.0
 SAUCENAO_DISCOVERY_SCORE = 80.0
-VERIFY_FRAME_DISTANCE = 8
+VERIFY_FRAME_DISTANCE = 24
 E621_SOURCE_PAGE_SIZE = 75
 E621_SOURCE_MAX_CANDIDATES = 5
-E621_SOURCE_EARLY_DISTANCE = 10
+E621_SOURCE_EARLY_DISTANCE = 6
 
 _LAST_E621_REQUEST = 0.0
 _LAST_E621_ERIS = 0.0
@@ -1117,10 +1117,11 @@ def source_first_local_candidates(
             as_float(entry.get("duration"), 0.0),
             remote_duration,
         )
-        # A very close early frame can survive a trim/duration mismatch and will
-        # still have to pass full multi-frame verification. Otherwise discard
-        # wildly different durations before expensive remote verification.
-        if duration_delta > 0.40 and int(early.get("min_distance") or 64) > 2:
+        # Source-first matching is deliberately strict: the e621 file and local
+        # Stash scene must be close in duration before an early visual hit can
+        # become a full-video candidate. This prevents generic-looking clips from
+        # reaching verification on frame similarity alone.
+        if duration_delta > 0.15:
             continue
 
         rank = (
@@ -1305,8 +1306,9 @@ def source_first_e621(
                 log(
                     "INFO",
                     f"e621 #{post.get('id')} -> Scene {entry['scene_id']}: "
-                    f"early distances {early.get('distances')}; verification "
-                    f"{matched_frames}/{total_frames}, median {median:.1f}",
+                    f"early distances {early.get('distances')}; aligned verification "
+                    f"{matched_frames}/{total_frames}, median {median:.1f}, "
+                    f"duration delta {float(verification.get('duration_delta') or 0.0):.1%}",
                 )
 
                 if verification.get("high"):
