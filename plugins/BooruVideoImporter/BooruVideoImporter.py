@@ -605,9 +605,9 @@ def saucenao_candidates(
 
 def media_url(source: str, post: Dict[str, Any]) -> Optional[str]:
     if source == "e621":
-        file_obj = post.get("file") or {}
-        ext = str(file_obj.get("ext") or "").casefold().lstrip(".")
-        url = str(file_obj.get("url") or "").strip()
+        info = e621_file_info(post)
+        ext = str(info.get("ext") or "").casefold().lstrip(".")
+        url = str(info.get("url") or "").strip()
         return url if ext in VIDEO_EXTENSIONS and url else None
     url = str(post.get("file_url") or "").strip()
     if not url:
