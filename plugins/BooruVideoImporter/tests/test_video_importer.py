@@ -608,5 +608,196 @@ class BooruVideoImporterTests(unittest.TestCase):
         self.assertEqual(save.call_args.kwargs["before_id"], 300)
 
 
+    def test_direct_e621_md5_lookup_requires_exact_video_md5(self):
+        exact = {
+            "id": 321,
+            "file": {
+                "ext": "webm",
+                "url": "https://example/321.webm",
+                "md5": "ABCDEF",
+                "duration": 60.0,
+            },
+        }
+        with mock.patch.object(
+            plugin, "e621_request", return_value=[exact]
+        ) as request:
+            post = plugin.e621_post_by_md5("abcdef", "user", "key")
+
+        self.assertIsNotNone(post)
+        self.assertEqual(post["id"], 321)
+        self.assertIn("md5%3Aabcdef", request.call_args.args[0])
+
+        image = {
+            "id": 322,
+            "file": {
+                "ext": "jpg",
+                "url": "https://example/322.jpg",
+                "md5": "abcdef",
+            },
+        }
+        with mock.patch.object(plugin, "e621_request", return_value=[image]):
+            self.assertIsNone(
+                plugin.e621_post_by_md5("abcdef", "user", "key")
+            )
+
+    def test_md5_is_read_from_primary_video_file_only(self):
+        scene = {
+            "files": [
+                {
+                    "id": "primary",
+                    "path": "/primary.mp4",
+                    "fingerprints": [
+                        {"type": "md5", "value": "PRIMARYMD5"},
+                    ],
+                },
+                {
+                    "id": "other",
+                    "path": "/other.mp4",
+                    "fingerprints": [
+                        {"type": "md5", "value": "OTHERMD5"},
+                    ],
+                },
+            ]
+        }
+        video = plugin.primary_video(scene)
+        self.assertEqual(
+            plugin.video_file_fingerprint(video, "md5"),
+            "PRIMARYMD5",
+        )
+
+    def test_exact_md5_match_bypasses_frame_and_history_search(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+        scene = {
+            "id": "10",
+            "organized": False,
+            "urls": [],
+            "tags": [],
+            "performers": [],
+            "studio": None,
+            "date": None,
+            "files": [{
+                "id": "f10",
+                "path": "/local.mp4",
+                "duration": 60.0,
+                "fingerprints": [
+                    {"type": "md5", "value": "ABCDEF"},
+                ],
+            }],
+        }
+        exact = {
+            "id": 999,
+            "created_at": "2026-09-01T00:00:00Z",
+            "tags": {},
+            "sources": [],
+            "file": {
+                "ext": "webm",
+                "url": "https://example/999.webm",
+                "md5": "abcdef",
+                "duration": 60.0,
+            },
+        }
+
+        with mock.patch.object(
+            plugin, "eligible_local_scenes",
+            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
+        ), mock.patch.object(
+            plugin, "_scope", return_value=(None, "__all__", "all"),
+        ), mock.patch.object(
+            plugin, "_load_scope_state",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
+        ), mock.patch.object(
+            plugin, "e621_post_by_md5", return_value=exact
+        ) as md5_lookup, mock.patch.object(
+            plugin, "_prepare_local_entry"
+        ) as prepare, mock.patch.object(
+            plugin, "e621_video_posts_page"
+        ) as pages, mock.patch.object(
+            plugin, "apply_e621_metadata"
+        ) as apply, mock.patch.object(
+            plugin, "_save_scope_state"
+        ):
+            stats = plugin.match_stash_against_e621(
+                stash,
+                {"e621_pages_per_run": 0},
+                {"dry_run": False, "pages_per_run": 0},
+            )
+
+        md5_lookup.assert_called_once_with("ABCDEF", "", "")
+        prepare.assert_not_called()
+        pages.assert_not_called()
+        apply.assert_called_once()
+        self.assertEqual(stats["md5_checked"], 1)
+        self.assertEqual(stats["md5_exact_matches"], 1)
+        self.assertEqual(stats["local_videos_matched"], 1)
+
+    def test_md5_miss_falls_back_to_duration_history_search(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+        scene = {
+            "id": "10",
+            "organized": False,
+            "urls": [],
+            "tags": [],
+            "performers": [],
+            "studio": None,
+            "date": None,
+            "files": [{
+                "id": "f10",
+                "path": "/local.mp4",
+                "duration": 60.0,
+                "fingerprints": [
+                    {"type": "md5", "value": "ABCDEF"},
+                ],
+            }],
+        }
+
+        with mock.patch.object(
+            plugin, "eligible_local_scenes",
+            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
+        ), mock.patch.object(
+            plugin, "_scope", return_value=(None, "__all__", "all"),
+        ), mock.patch.object(
+            plugin, "_load_scope_state",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
+        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
+            plugin, "e621_post_by_md5", return_value=None
+        ), mock.patch.object(
+            plugin, "_prepare_local_entry",
+            return_value={
+                "scene": scene,
+                "scene_id": "10",
+                "path": "/local.mp4",
+                "duration": 60.0,
+                "duration_ms": 60000,
+                "early_hashes": [1, 2],
+            },
+        ) as prepare, mock.patch.object(
+            plugin, "e621_video_posts_page", return_value=[]
+        ) as pages, mock.patch.object(
+            plugin, "_save_scope_state"
+        ):
+            stats = plugin.match_stash_against_e621(
+                stash,
+                {"e621_pages_per_run": 0},
+                {"dry_run": False, "pages_per_run": 0},
+            )
+
+        prepare.assert_called_once()
+        self.assertGreaterEqual(pages.call_count, 2)
+        self.assertEqual(stats["md5_checked"], 1)
+        self.assertEqual(stats["md5_exact_matches"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
