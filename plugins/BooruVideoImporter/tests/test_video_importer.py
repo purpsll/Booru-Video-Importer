@@ -166,7 +166,8 @@ class BooruVideoImporterTests(unittest.TestCase):
         stash = mock.Mock()
         stash.ffmpeg_path.return_value = "ffmpeg"
         fake_catalog = mock.Mock()
-        fake_catalog.count.side_effect = [0, 1]
+        fake_catalog.count.side_effect = [0, 1, 1]
+        fake_catalog.upsert_videos.return_value = 1
         fake_catalog.hashed_count.return_value = 1
         fake_catalog.failed_count.return_value = 0
         fake_catalog.duration_bucket_count.return_value = 1
