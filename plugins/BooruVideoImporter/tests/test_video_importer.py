@@ -452,5 +452,198 @@ class VideoMatchTests(unittest.TestCase):
         save.assert_called_once()
 
 
+    def test_stash_first_checks_next_exact_duration_candidate_until_match(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+
+        scene = {
+            "id": "10",
+            "tags": [],
+            "performers": [],
+            "urls": [],
+            "studio": None,
+            "date": None,
+        }
+        local_entry = {
+            "scene": scene,
+            "scene_id": "10",
+            "path": "/local.mp4",
+            "duration": 60.0,
+            "hashes": [1, 2],
+        }
+        first = {
+            "id": 200,
+            "file": {
+                "ext": "webm",
+                "url": "https://e621.example/200.webm",
+                "duration": 60.0,
+            },
+        }
+        second = {
+            "id": 199,
+            "file": {
+                "ext": "webm",
+                "url": "https://e621.example/199.webm",
+                "duration": 60.0,
+            },
+        }
+
+        high = {
+            "high": True,
+            "review": False,
+            "matched_frames": 7,
+            "total_frames": 7,
+            "median_distance": 0.0,
+        }
+
+        with mock.patch.object(
+            plugin, "build_local_source_index",
+            return_value=([local_entry], {"skipped_organized": 0}),
+        ), mock.patch.object(
+            plugin, "_source_cursor_scope",
+            return_value=("__all__", "all eligible Stash videos"),
+        ), mock.patch.object(
+            plugin, "_load_source_cursor",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "_save_source_cursor",
+        ), mock.patch.object(
+            plugin, "e621_video_posts_page",
+            return_value=[first, second],
+        ), mock.patch.object(
+            plugin, "early_frame_hashes",
+            side_effect=[[9, 9], [1, 2]],
+        ), mock.patch.object(
+            plugin, "early_hash_candidate",
+            side_effect=[
+                {"candidate": False, "distances": [9, 9]},
+                {"candidate": True, "distances": [0, 0]},
+            ],
+        ) as early, mock.patch.object(
+            plugin, "frame_hashes",
+            side_effect=[[10] * 7, [10] * 7],
+        ), mock.patch.object(
+            plugin, "verify_video_candidate",
+            return_value=high,
+        ), mock.patch.object(
+            plugin, "apply_metadata",
+        ) as apply:
+            stats = plugin.stash_first_e621(
+                stash,
+                {"e621_source_pages": 5},
+                {"dry_run": False},
+            )
+
+        self.assertEqual(early.call_count, 2)
+        self.assertEqual(stats["e621_exact_duration_candidates"], 2)
+        self.assertEqual(stats["local_scenes_matched"], 1)
+        apply.assert_called_once()
+        self.assertEqual(apply.call_args.args[3]["id"], 199)
+
+    def test_stash_first_exhausts_one_local_video_then_restarts_next_from_newest(self):
+        stash = mock.Mock()
+        stash.ffmpeg_path.return_value = "ffmpeg"
+        stash.all_tags.return_value = {}
+        stash.all_performers.return_value = {}
+        stash.all_studios.return_value = {}
+
+        entries = [
+            {
+                "scene": {"id": "10", "tags": [], "performers": [], "urls": [], "studio": None, "date": None},
+                "scene_id": "10",
+                "path": "/one.mp4",
+                "duration": 60.0,
+                "hashes": [1, 2],
+            },
+            {
+                "scene": {"id": "11", "tags": [], "performers": [], "urls": [], "studio": None, "date": None},
+                "scene_id": "11",
+                "path": "/two.mp4",
+                "duration": 70.0,
+                "hashes": [3, 4],
+            },
+        ]
+        wrong = {
+            "id": 300,
+            "file": {
+                "ext": "webm",
+                "url": "https://e621.example/300.webm",
+                "duration": 60.0,
+            },
+        }
+        right = {
+            "id": 400,
+            "file": {
+                "ext": "webm",
+                "url": "https://e621.example/400.webm",
+                "duration": 70.0,
+            },
+        }
+        high = {
+            "high": True,
+            "review": False,
+            "matched_frames": 7,
+            "total_frames": 7,
+            "median_distance": 0.0,
+        }
+
+        calls = []
+        def page_lookup(_user, _key, before_id=None, limit=75):
+            calls.append(before_id)
+            if len(calls) == 1:
+                return [wrong]
+            if len(calls) == 2:
+                return []
+            if len(calls) == 3:
+                return [right]
+            return []
+
+        with mock.patch.object(
+            plugin, "build_local_source_index",
+            return_value=(entries, {"skipped_organized": 0}),
+        ), mock.patch.object(
+            plugin, "_source_cursor_scope",
+            return_value=("__all__", "all eligible Stash videos"),
+        ), mock.patch.object(
+            plugin, "_load_source_cursor",
+            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+        ), mock.patch.object(
+            plugin, "_save_source_cursor",
+        ), mock.patch.object(
+            plugin, "e621_video_posts_page",
+            side_effect=page_lookup,
+        ), mock.patch.object(
+            plugin, "early_frame_hashes",
+            side_effect=[[8, 8], [3, 4]],
+        ), mock.patch.object(
+            plugin, "early_hash_candidate",
+            side_effect=[
+                {"candidate": False, "distances": [8, 8]},
+                {"candidate": True, "distances": [0, 0]},
+            ],
+        ), mock.patch.object(
+            plugin, "frame_hashes",
+            side_effect=[[10] * 7, [20] * 7, [20] * 7],
+        ), mock.patch.object(
+            plugin, "verify_video_candidate",
+            return_value=high,
+        ), mock.patch.object(
+            plugin, "apply_metadata",
+        ) as apply:
+            stats = plugin.stash_first_e621(
+                stash,
+                {"e621_source_pages": 5},
+                {"dry_run": False},
+            )
+
+        self.assertEqual(calls[:3], [None, 300, None])
+        self.assertEqual(stats["local_scenes_no_match"], 1)
+        self.assertEqual(stats["local_scenes_matched"], 1)
+        self.assertEqual(apply.call_args.args[1]["id"], "11")
+
+
 if __name__ == "__main__":
     unittest.main()
