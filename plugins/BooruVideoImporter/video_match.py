@@ -141,7 +141,7 @@ def early_frame_hashes(
 def early_hash_candidate(
     local_hashes: Iterable[int],
     remote_hashes: Iterable[int],
-    max_distance: int = 6,
+    max_distance: int = 4,
 ) -> Dict[str, object]:
     """Require two aligned early-frame hashes before expensive verification.
 
@@ -266,7 +266,7 @@ def verify_video_candidate(
     remote_source: str,
     ffmpeg_path: str = "ffmpeg",
     ratios: Iterable[float] = DEFAULT_RATIOS,
-    frame_distance: int = 24,
+    frame_distance: int = 16,
     timeout: int = 45,
     local_duration: float | None = None,
     local_hashes: List[int] | None = None,
@@ -305,19 +305,22 @@ def verify_video_candidate(
         else 1.0
     )
 
-    required_high = max(6, pair_count - 1)
+    # Source-first verification intentionally favors false negatives. A high
+    # confidence result requires every sampled timestamp to agree closely and the
+    # files to have nearly identical runtime.
     high = (
-        pair_count >= 6
-        and matched >= required_high
-        and median <= 18.0
-        and duration_delta <= 0.08
+        pair_count >= 7
+        and matched == pair_count
+        and median <= 10.0
+        and max(aligned, default=256) <= frame_distance
+        and duration_delta <= 0.02
     )
     review = (
         not high
-        and pair_count >= 6
-        and matched >= 5
-        and median <= 26.0
-        and duration_delta <= 0.15
+        and pair_count >= 7
+        and matched >= pair_count - 1
+        and median <= 16.0
+        and duration_delta <= 0.05
     )
 
     return {
