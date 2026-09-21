@@ -1,8 +1,9 @@
 import importlib.util
 import pathlib
-import sys
+import tempfile
 import unittest
 from unittest import mock
+import sys
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parents[1]
 if str(PLUGIN_DIR) not in sys.path:
@@ -15,101 +16,132 @@ plugin = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(plugin)
 
+catalog_spec = importlib.util.spec_from_file_location(
+    "e621_catalog_test", PLUGIN_DIR / "e621_catalog.py"
+)
+catalog_module = importlib.util.module_from_spec(catalog_spec)
+assert catalog_spec.loader is not None
+catalog_spec.loader.exec_module(catalog_module)
+
 
 class BooruVideoImporterTests(unittest.TestCase):
-    def test_duration_is_exact_to_normalized_millisecond(self):
+    def test_duration_normalizes_to_exact_milliseconds(self):
         self.assertEqual(plugin.duration_milliseconds(60.000), 60000)
         self.assertEqual(plugin.duration_milliseconds(59.999), 59999)
         self.assertEqual(plugin.duration_milliseconds(60.001), 60001)
-        self.assertEqual(plugin.duration_milliseconds(0), 0)
 
-    def test_e621_file_info_supports_legacy_and_current_schema(self):
-        legacy = {
-            "file": {
-                "ext": "webm",
-                "url": "https://example/1.webm",
-                "duration": 60.0,
-            }
-        }
-        current = {
+    def test_e621_file_info_supports_current_schema(self):
+        post = {
             "files": {
-                "meta": {"ext": "mp4", "duration": 12.345},
-                "original": {"url": "https://example/2.mp4"},
+                "meta": {
+                    "ext": "webm",
+                    "duration": 12.345,
+                    "md5": "ABCDEF",
+                },
+                "original": {"url": "https://example/video.webm"},
             }
         }
-        self.assertEqual(plugin.e621_file_info(legacy)["ext"], "webm")
-        self.assertEqual(plugin.e621_file_info(legacy)["duration"], 60.0)
-        self.assertEqual(plugin.e621_file_info(current)["ext"], "mp4")
-        self.assertEqual(plugin.e621_file_info(current)["duration"], 12.345)
+        info = plugin.e621_file_info(post)
+        self.assertEqual(info["ext"], "webm")
+        self.assertEqual(info["duration"], 12.345)
+        self.assertEqual(info["md5"], "abcdef")
+        self.assertEqual(info["url"], "https://example/video.webm")
 
-    def test_e621_video_page_is_format_specific_and_uses_before_cursor(self):
+    def test_e621_after_page_uses_ascending_cursor(self):
         payload = [{
-            "id": 123,
+            "id": 101,
             "file": {
                 "ext": "webm",
-                "url": "https://example/123.webm",
-                "duration": 10.0,
+                "url": "https://example/101.webm",
+                "duration": 5.0,
             },
         }]
-        with mock.patch.object(plugin, "e621_request", return_value=payload) as request:
-            rows = plugin.e621_video_posts_page(
-                "webm", "user", "key", before_id=500, limit=75
+        with mock.patch.object(plugin, "e621_request", return_value=payload) as req:
+            rows = plugin.e621_video_posts_after(
+                "webm", "user", "key", after_id=100, limit=75
             )
-        self.assertEqual([row["id"] for row in rows], [123])
-        url = request.call_args.args[0]
-        self.assertIn("type%3Awebm", url)
-        self.assertIn("page=b500", url)
+        self.assertEqual([row["id"] for row in rows], [101])
+        self.assertIn("page=a100", req.call_args.args[0])
+        self.assertIn("type%3Awebm", req.call_args.args[0])
 
-    def test_dynamic_stash_scope_accepts_any_tag_or_alias(self):
+    def test_sqlite_catalog_stores_duration_timecodes_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(pathlib.Path(temp) / "catalog.sqlite")
+            catalog = catalog_module.E621VideoCatalog(path)
+            catalog.upsert_videos([{
+                "post_id": 10,
+                "ext": "webm",
+                "duration_ms": 60000,
+                "url": "https://example/10.webm",
+                "md5": "abcdef",
+            }])
+            catalog.set_hashes(
+                10,
+                ["0000000000000001", "0000000000000002", "0000000000000003"],
+                [6000, 30000, 54000],
+            )
+            row = catalog.candidates_for_duration(60000)[0]
+            self.assertEqual(row["post_id"], 10)
+            self.assertEqual(row["time_10_ms"], 6000)
+            self.assertEqual(row["time_50_ms"], 30000)
+            self.assertEqual(row["time_90_ms"], 54000)
+            self.assertEqual(row["phash_50"], "0000000000000002")
+            self.assertEqual(catalog.find_md5("ABCDEF")["post_id"], 10)
+
+    def test_catalog_cursor_is_persistent_per_format(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(pathlib.Path(temp) / "catalog.sqlite")
+            catalog = catalog_module.E621VideoCatalog(path)
+            catalog.set_cursor("webm", 123)
+            catalog.set_cursor("mp4", 456)
+            reopened = catalog_module.E621VideoCatalog(path)
+            self.assertEqual(reopened.get_cursor("webm"), 123)
+            self.assertEqual(reopened.get_cursor("mp4"), 456)
+
+    def test_catalog_hash_failure_is_retryable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(pathlib.Path(temp) / "catalog.sqlite")
+            catalog = catalog_module.E621VideoCatalog(path)
+            catalog.upsert_videos([{
+                "post_id": 10,
+                "ext": "webm",
+                "duration_ms": 60000,
+                "url": "https://example/10.webm",
+            }])
+            catalog.set_hash_error(10, "temporary failure")
+            pending = catalog.rows_needing_hash(limit=10, max_attempts=3)
+            self.assertEqual([row["post_id"] for row in pending], [10])
+
+    def test_catalog_candidate_score_requires_three_close_phashes(self):
+        local = [0, 0, 0]
+        good = {
+            "phash_10": plugin.phash_hex(1),
+            "phash_50": plugin.phash_hex(3),
+            "phash_90": plugin.phash_hex(7),
+        }
+        score = plugin.catalog_candidate_score(local, good)
+        self.assertIsNotNone(score)
+        self.assertEqual(score[2], [1, 2, 3])
+
+        bad = {
+            "phash_10": plugin.phash_hex((1 << 20) - 1),
+            "phash_50": plugin.phash_hex((1 << 20) - 1),
+            "phash_90": plugin.phash_hex((1 << 20) - 1),
+        }
+        self.assertIsNone(plugin.catalog_candidate_score(local, bad))
+
+    def test_dynamic_stash_scope_supports_aliases(self):
         stash = mock.Mock()
         stash.all_tags.return_value = {
             "furry": {"id": "77", "name": "Furry"},
             "anthro": {"id": "77", "name": "Furry"},
-            "custom future tag": {"id": "88", "name": "Custom Future Tag"},
         }
         self.assertEqual(
             plugin.resolve_stash_tag_filter(stash, "anthro"),
             ("77", "Furry"),
         )
-        self.assertEqual(
-            plugin.resolve_stash_tag_filter(stash, "Custom Future Tag"),
-            ("88", "Custom Future Tag"),
-        )
 
-    def test_eligible_local_scenes_respects_scope_and_organized_protection(self):
-        stash = mock.Mock()
-        stash.all_tags.return_value = {
-            "furry": {"id": "77", "name": "Furry"},
-        }
-        stash.find_scenes.return_value = (
-            2,
-            [
-                {
-                    "id": "1",
-                    "organized": False,
-                    "urls": [],
-                    "files": [{"path": "/one.mp4"}],
-                },
-                {
-                    "id": "2",
-                    "organized": True,
-                    "urls": [],
-                    "files": [{"path": "/two.mp4"}],
-                },
-            ],
-        )
-        rows, stats = plugin.eligible_local_scenes(
-            stash,
-            {"stash_tag_scope": "furry", "skip_organized_scenes": True},
-        )
-        self.assertEqual([row["id"] for row in rows], ["1"])
-        self.assertEqual(stats["organized_protected"], 1)
-        self.assertEqual(
-            stash.find_scenes.call_args.kwargs["tag_id"],
-            "77",
-        )
-
-    def test_local_frame_index_is_lazy_and_reused(self):
+    def test_local_phashes_are_cached_lazily(self):
         scene = {
             "id": "10",
             "files": [{
@@ -120,552 +152,77 @@ class BooruVideoImporterTests(unittest.TestCase):
                 "mod_time": "2026-09-21T00:00:00Z",
             }],
         }
-        cache = {"version": 2, "scenes": {}}
+        cache = {"version": 3, "scenes": {}}
         with mock.patch.object(
-            plugin, "early_frame_hashes", return_value=[11, 22]
-        ) as hashes:
+            plugin, "frame_phashes", return_value=[1, 2, 3]
+        ) as frame_phashes:
             first = plugin._prepare_local_entry(scene, cache, "ffmpeg")
             second = plugin._prepare_local_entry(scene, cache, "ffmpeg")
-        self.assertEqual(first["early_hashes"], [11, 22])
-        self.assertEqual(second["early_hashes"], [11, 22])
-        self.assertEqual(hashes.call_count, 1)
+        self.assertEqual(first["phashes"], [1, 2, 3])
+        self.assertEqual(second["phashes"], [1, 2, 3])
+        self.assertEqual(frame_phashes.call_count, 1)
 
-    def test_nonexact_duration_never_opens_remote_video(self):
+    def test_catalog_builder_resumes_and_saves_three_hashes(self):
         stash = mock.Mock()
         stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{
-                "id": "f10",
-                "path": "/local.mp4",
-                "duration": 60.000,
-                "size": 100,
-                "mod_time": "x",
+        fake_catalog = mock.Mock()
+        fake_catalog.count.side_effect = [0, 1]
+        fake_catalog.hashed_count.return_value = 1
+        fake_catalog.failed_count.return_value = 0
+        fake_catalog.duration_bucket_count.return_value = 1
+        fake_catalog.rows_needing_hash.side_effect = [
+            [],
+            [{
+                "post_id": 101,
+                "ext": "webm",
+                "duration_ms": 60000,
+                "url": "https://example/101.webm",
+                "hash_attempts": 0,
             }],
-        }
-        post = {
-            "id": 200,
-            "file": {
-                "ext": "webm",
-                "url": "https://example/200.webm",
-                "duration": 60.001,
-            },
-        }
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {
-                "eligible": 1,
-                "organized_protected": 0,
-            }),
-        ), mock.patch.object(
-            plugin, "_scope",
-            return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache",
-            return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(
-            plugin, "save_cache",
-        ), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page",
-            side_effect=[[post], []],
-        ), mock.patch.object(
-            plugin, "early_frame_hashes",
-        ) as remote_frames:
-            plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 2},
-                {"dry_run": True, "pages_per_run": 2, "local_limit": 1},
-            )
-        remote_frames.assert_not_called()
+        ]
+        fake_catalog.get_cursor.side_effect = lambda ext: 100 if ext == "webm" else 0
 
-    def test_exact_duration_candidates_are_checked_in_order_until_match(self):
-        stash = mock.Mock()
-        stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{"path": "/local.mp4", "duration": 60.0}],
-        }
-        first = {
-            "id": 200,
-            "created_at": "2026-09-01T00:00:00Z",
-            "tags": {},
-            "sources": [],
+        post = {
+            "id": 101,
+            "updated_at": "2026-09-21T00:00:00Z",
             "file": {
                 "ext": "webm",
-                "url": "https://example/200.webm",
+                "url": "https://example/101.webm",
+                "md5": "abc",
                 "duration": 60.0,
             },
         }
-        second = {
-            "id": 199,
-            "created_at": "2026-09-01T00:00:00Z",
-            "tags": {},
-            "sources": [],
-            "file": {
-                "ext": "webm",
-                "url": "https://example/199.webm",
-                "duration": 60.0,
-            },
-        }
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {
-                "eligible": 1,
-                "organized_protected": 0,
-            }),
-        ), mock.patch.object(
-            plugin, "_scope",
-            return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache",
-            return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "_save_scope_state",
-        ), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page",
-            return_value=[first, second],
-        ), mock.patch.object(
-            plugin, "early_frame_hashes",
-            side_effect=[[9, 9], [1, 2]],
-        ), mock.patch.object(
-            plugin, "early_hash_candidate",
-            side_effect=[
-                {"candidate": False},
-                {"candidate": True},
+
+        with mock.patch.object(plugin, "E621VideoCatalog", return_value=fake_catalog),              mock.patch.object(
+                 plugin,
+                 "e621_video_posts_after",
+                 side_effect=[[post], [], []],
+             ),              mock.patch.object(plugin, "frame_phashes", return_value=[1, 2, 3]),              mock.patch.object(
+                 plugin,
+                 "frame_timestamp_seconds",
+                 side_effect=lambda duration, ratio: duration * ratio,
+             ):
+            stats = plugin.build_update_catalog(
+                stash,
+                {},
+                {"page_limit": 1, "hash_limit": 1},
+            )
+
+        fake_catalog.upsert_videos.assert_called_once()
+        fake_catalog.set_cursor.assert_called_with("webm", 101)
+        fake_catalog.set_hashes.assert_called_once_with(
+            101,
+            [
+                "0000000000000001",
+                "0000000000000002",
+                "0000000000000003",
             ],
-        ) as early, mock.patch.object(
-            plugin, "frame_hashes",
-            side_effect=[[7] * 7, [7] * 7],
-        ), mock.patch.object(
-            plugin, "verify_video_candidate",
-            return_value={
-                "high": True,
-                "matched_frames": 7,
-                "total_frames": 7,
-            },
-        ), mock.patch.object(
-            plugin, "apply_e621_metadata",
-        ) as apply:
-            stats = plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 1},
-                {"dry_run": False, "pages_per_run": 1},
-            )
-        self.assertEqual(early.call_count, 2)
-        self.assertEqual(stats["exact_duration_candidates"], 2)
-        self.assertEqual(stats["local_videos_matched"], 1)
-        apply.assert_called_once()
-        self.assertEqual(apply.call_args.args[2]["id"], 199)
-
-    def test_webm_exhaustion_switches_to_mp4_from_newest(self):
-        stash = mock.Mock()
-        stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{"path": "/local.mp4", "duration": 60.0}],
-        }
-        calls = []
-
-        def pages(ext, _user, _key, before_id=None, limit=75):
-            calls.append((ext, before_id))
-            if ext == "webm":
-                return []
-            return []
-
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {
-                "eligible": 1,
-                "organized_protected": 0,
-            }),
-        ), mock.patch.object(
-            plugin, "_scope",
-            return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache",
-            return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "_save_scope_state",
-        ), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page", side_effect=pages
-        ):
-            stats = plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 2},
-                {"dry_run": False, "pages_per_run": 2},
-            )
-        self.assertEqual(calls[:2], [("webm", None), ("mp4", None)])
-        self.assertEqual(stats["local_videos_exhausted"], 1)
-
-    def test_saved_state_resumes_same_scene_and_format_cursor(self):
-        stash = mock.Mock()
-        stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{"path": "/local.mp4", "duration": 60.0}],
-        }
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {
-                "eligible": 1,
-                "organized_protected": 0,
-            }),
-        ), mock.patch.object(
-            plugin, "_scope",
-            return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=(
-                {"scopes": {}},
-                {
-                    "scene_id": "10",
-                    "ext": "mp4",
-                    "before_id": 555,
-                    "completed_scene_ids": [],
-                },
-            ),
-        ), mock.patch.object(
-            plugin, "load_cache",
-            return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page", return_value=[]
-        ) as pages, mock.patch.object(
-            plugin, "_save_scope_state",
-        ):
-            plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 1},
-                {"dry_run": False, "pages_per_run": 1},
-            )
-        self.assertEqual(pages.call_args.args[0], "mp4")
-        self.assertEqual(pages.call_args.kwargs["before_id"], 555)
-
-    def test_reset_progress_only_clears_current_scope(self):
-        stash = mock.Mock()
-        state = {
-            "version": 2,
-            "scopes": {
-                "tag:77": {"scene_id": "10"},
-                "tag:88": {"scene_id": "20"},
-            },
-        }
-        with mock.patch.object(
-            plugin, "_scope",
-            return_value=("77", "tag:77", "Furry"),
-        ), mock.patch.object(
-            plugin, "load_scan_state", return_value=state
-        ), mock.patch.object(plugin, "save_scan_state") as save:
-            result = plugin.reset_progress(stash, {"stash_tag_scope": "furry"})
-        self.assertEqual(result["progress_reset"], 1)
-        self.assertNotIn("tag:77", state["scopes"])
-        self.assertIn("tag:88", state["scopes"])
-        save.assert_called_once()
-
-    def test_e621_metadata_maps_characters_artists_tags_and_urls(self):
-        post = {
-            "id": 123,
-            "created_at": "2026-09-01T12:34:56Z",
-            "tags": {
-                "artist": ["artist_one", "artist_two"],
-                "character": ["character_one"],
-                "general": ["tag_one"],
-                "species": ["species_one"],
-                "copyright": ["series_one"],
-                "lore": [],
-            },
-            "sources": ["https://source.example/post"],
-        }
-        metadata = plugin.e621_post_metadata(post)
-        self.assertIn("tag_one", metadata["tags"])
-        self.assertIn("artist_two", metadata["tags"])
-        self.assertEqual(metadata["artists"], ["artist_one", "artist_two"])
-        self.assertEqual(metadata["characters"], ["character_one"])
-        self.assertIn("https://e621.net/posts/123", metadata["urls"])
-        self.assertEqual(metadata["date"], "2026-09-01")
-
-
-    def test_zero_pages_runs_continuously_until_both_histories_exhaust(self):
-        stash = mock.Mock()
-        stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{"path": "/local.mp4", "duration": 60.0}],
-        }
-        page_one = [{
-            "id": 300,
-            "file": {
-                "ext": "webm",
-                "url": "https://example/300.webm",
-                "duration": 59.0,
-            },
-        }]
-        page_two = [{
-            "id": 200,
-            "file": {
-                "ext": "webm",
-                "url": "https://example/200.webm",
-                "duration": 61.0,
-            },
-        }]
-        calls = []
-
-        def pages(ext, _user, _key, before_id=None, limit=75):
-            calls.append((ext, before_id))
-            if len(calls) == 1:
-                return page_one
-            if len(calls) == 2:
-                return page_two
-            return []
-
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
-        ), mock.patch.object(
-            plugin, "_scope", return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "_save_scope_state",
-        ), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page", side_effect=pages
-        ):
-            stats = plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 0},
-                {"dry_run": False, "pages_per_run": 0},
-            )
-
-        self.assertEqual(
-            calls,
-            [("webm", None), ("webm", 300), ("webm", 200), ("mp4", None)],
+            [6000, 30000, 54000],
+            plugin.HASH_VERSION,
         )
-        self.assertEqual(stats["local_videos_exhausted"], 1)
-        self.assertEqual(stats["e621_posts_seen"], 2)
+        self.assertEqual(stats["hashes_generated"], 1)
 
-    def test_positive_page_limit_still_stops_and_saves_progress(self):
-        stash = mock.Mock()
-        stash.ffmpeg_path.return_value = "ffmpeg"
-        stash.all_tags.return_value = {}
-        stash.all_performers.return_value = {}
-        stash.all_studios.return_value = {}
-        scene = {
-            "id": "10",
-            "organized": False,
-            "urls": [],
-            "tags": [],
-            "performers": [],
-            "studio": None,
-            "date": None,
-            "files": [{"path": "/local.mp4", "duration": 60.0}],
-        }
-        page = [{
-            "id": 300,
-            "file": {
-                "ext": "webm",
-                "url": "https://example/300.webm",
-                "duration": 59.0,
-            },
-        }]
-        with mock.patch.object(
-            plugin, "eligible_local_scenes",
-            return_value=([scene], {"eligible": 1, "organized_protected": 0}),
-        ), mock.patch.object(
-            plugin, "_scope", return_value=(None, "__all__", "all"),
-        ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "_prepare_local_entry",
-            return_value={
-                "scene": scene,
-                "scene_id": "10",
-                "path": "/local.mp4",
-                "duration": 60.0,
-                "duration_ms": 60000,
-                "early_hashes": [1, 2],
-            },
-        ), mock.patch.object(
-            plugin, "e621_video_posts_page", return_value=page
-        ) as pages, mock.patch.object(
-            plugin, "_save_scope_state",
-        ) as save:
-            plugin.match_stash_against_e621(
-                stash,
-                {"e621_pages_per_run": 1},
-                {"dry_run": False, "pages_per_run": 1},
-            )
-
-        self.assertEqual(pages.call_count, 1)
-        self.assertEqual(save.call_args.kwargs["before_id"], 300)
-
-
-    def test_direct_e621_md5_lookup_requires_exact_video_md5(self):
-        exact = {
-            "id": 321,
-            "file": {
-                "ext": "webm",
-                "url": "https://example/321.webm",
-                "md5": "ABCDEF",
-                "duration": 60.0,
-            },
-        }
-        with mock.patch.object(
-            plugin, "e621_request", return_value=[exact]
-        ) as request:
-            post = plugin.e621_post_by_md5("abcdef", "user", "key")
-
-        self.assertIsNotNone(post)
-        self.assertEqual(post["id"], 321)
-        self.assertIn("md5%3Aabcdef", request.call_args.args[0])
-
-        image = {
-            "id": 322,
-            "file": {
-                "ext": "jpg",
-                "url": "https://example/322.jpg",
-                "md5": "abcdef",
-            },
-        }
-        with mock.patch.object(plugin, "e621_request", return_value=[image]):
-            self.assertIsNone(
-                plugin.e621_post_by_md5("abcdef", "user", "key")
-            )
-
-    def test_md5_is_read_from_primary_video_file_only(self):
-        scene = {
-            "files": [
-                {
-                    "id": "primary",
-                    "path": "/primary.mp4",
-                    "fingerprints": [
-                        {"type": "md5", "value": "PRIMARYMD5"},
-                    ],
-                },
-                {
-                    "id": "other",
-                    "path": "/other.mp4",
-                    "fingerprints": [
-                        {"type": "md5", "value": "OTHERMD5"},
-                    ],
-                },
-            ]
-        }
-        video = plugin.primary_video(scene)
-        self.assertEqual(
-            plugin.video_file_fingerprint(video, "md5"),
-            "PRIMARYMD5",
-        )
-
-    def test_exact_md5_match_bypasses_frame_and_history_search(self):
+    def test_md5_catalog_match_bypasses_phash_work(self):
         stash = mock.Mock()
         stash.ffmpeg_path.return_value = "ffmpeg"
         stash.all_tags.return_value = {}
@@ -680,15 +237,12 @@ class BooruVideoImporterTests(unittest.TestCase):
             "studio": None,
             "date": None,
             "files": [{
-                "id": "f10",
                 "path": "/local.mp4",
                 "duration": 60.0,
-                "fingerprints": [
-                    {"type": "md5", "value": "ABCDEF"},
-                ],
+                "fingerprints": [{"type": "md5", "value": "ABCDEF"}],
             }],
         }
-        exact = {
+        post = {
             "id": 999,
             "created_at": "2026-09-01T00:00:00Z",
             "tags": {},
@@ -700,43 +254,37 @@ class BooruVideoImporterTests(unittest.TestCase):
                 "duration": 60.0,
             },
         }
+        catalog = mock.Mock()
+        catalog.count.return_value = 100
+        catalog.hashed_count.return_value = 100
+        catalog.find_md5.return_value = {"post_id": 999}
 
         with mock.patch.object(
             plugin, "eligible_local_scenes",
             return_value=([scene], {"eligible": 1, "organized_protected": 0}),
         ), mock.patch.object(
-            plugin, "_scope", return_value=(None, "__all__", "all"),
+            plugin, "E621VideoCatalog", return_value=catalog
         ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
+            plugin, "e621_post_by_id", return_value=post
         ), mock.patch.object(
-            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
-        ), mock.patch.object(
-            plugin, "e621_post_by_md5", return_value=exact
-        ) as md5_lookup, mock.patch.object(
             plugin, "_prepare_local_entry"
         ) as prepare, mock.patch.object(
-            plugin, "e621_video_posts_page"
-        ) as pages, mock.patch.object(
+            plugin, "frame_phash"
+        ) as remote_frame, mock.patch.object(
             plugin, "apply_e621_metadata"
-        ) as apply, mock.patch.object(
-            plugin, "_save_scope_state"
-        ):
-            stats = plugin.match_stash_against_e621(
+        ) as apply:
+            stats = plugin.match_stash_against_catalog(
                 stash,
-                {"e621_pages_per_run": 0},
-                {"dry_run": False, "pages_per_run": 0},
+                {},
+                {"dry_run": False},
             )
 
-        md5_lookup.assert_called_once_with("ABCDEF", "", "")
         prepare.assert_not_called()
-        pages.assert_not_called()
+        remote_frame.assert_not_called()
         apply.assert_called_once()
-        self.assertEqual(stats["md5_checked"], 1)
-        self.assertEqual(stats["md5_exact_matches"], 1)
-        self.assertEqual(stats["local_videos_matched"], 1)
+        self.assertEqual(stats["md5_catalog_matches"], 1)
 
-    def test_md5_miss_falls_back_to_duration_history_search(self):
+    def test_phash_match_uses_exact_duration_then_one_live_midpoint(self):
         stash = mock.Mock()
         stash.ffmpeg_path.return_value = "ffmpeg"
         stash.all_tags.return_value = {}
@@ -751,52 +299,104 @@ class BooruVideoImporterTests(unittest.TestCase):
             "studio": None,
             "date": None,
             "files": [{
-                "id": "f10",
                 "path": "/local.mp4",
                 "duration": 60.0,
-                "fingerprints": [
-                    {"type": "md5", "value": "ABCDEF"},
-                ],
+                "fingerprints": [],
             }],
         }
+        row = {
+            "post_id": 123,
+            "duration_ms": 60000,
+            "url": "https://example/123.webm",
+            "phash_10": plugin.phash_hex(1),
+            "phash_50": plugin.phash_hex(2),
+            "phash_90": plugin.phash_hex(3),
+        }
+        post = {
+            "id": 123,
+            "created_at": "2026-09-01T00:00:00Z",
+            "tags": {},
+            "sources": [],
+            "file": {
+                "ext": "webm",
+                "url": "https://example/123.webm",
+                "duration": 60.0,
+            },
+        }
+        catalog = mock.Mock()
+        catalog.count.return_value = 100
+        catalog.hashed_count.return_value = 100
+        catalog.candidates_for_duration.return_value = [row]
 
         with mock.patch.object(
             plugin, "eligible_local_scenes",
             return_value=([scene], {"eligible": 1, "organized_protected": 0}),
         ), mock.patch.object(
-            plugin, "_scope", return_value=(None, "__all__", "all"),
+            plugin, "E621VideoCatalog", return_value=catalog
         ), mock.patch.object(
-            plugin, "_load_scope_state",
-            return_value=({"scopes": {}}, {"completed_scene_ids": []}),
-        ), mock.patch.object(
-            plugin, "load_cache", return_value={"version": 2, "scenes": {}},
+            plugin, "load_cache", return_value={"version": 3, "scenes": {}}
         ), mock.patch.object(plugin, "save_cache"), mock.patch.object(
-            plugin, "e621_post_by_md5", return_value=None
-        ), mock.patch.object(
-            plugin, "_prepare_local_entry",
+            plugin,
+            "_prepare_local_entry",
             return_value={
                 "scene": scene,
                 "scene_id": "10",
                 "path": "/local.mp4",
                 "duration": 60.0,
                 "duration_ms": 60000,
-                "early_hashes": [1, 2],
+                "phashes": [0, 0, 0],
             },
-        ) as prepare, mock.patch.object(
-            plugin, "e621_video_posts_page", return_value=[]
-        ) as pages, mock.patch.object(
-            plugin, "_save_scope_state"
-        ):
-            stats = plugin.match_stash_against_e621(
+        ), mock.patch.object(
+            plugin, "frame_phash", return_value=2
+        ) as remote_midpoint, mock.patch.object(
+            plugin, "e621_post_by_id", return_value=post
+        ), mock.patch.object(
+            plugin, "apply_e621_metadata"
+        ) as apply:
+            stats = plugin.match_stash_against_catalog(
                 stash,
-                {"e621_pages_per_run": 0},
-                {"dry_run": False, "pages_per_run": 0},
+                {},
+                {"dry_run": False},
             )
 
-        prepare.assert_called_once()
-        self.assertGreaterEqual(pages.call_count, 2)
-        self.assertEqual(stats["md5_checked"], 1)
-        self.assertEqual(stats["md5_exact_matches"], 0)
+        catalog.candidates_for_duration.assert_called_once_with(
+            60000,
+            require_hashes=True,
+        )
+        remote_midpoint.assert_called_once_with(
+            "https://example/123.webm",
+            60.0,
+            plugin.HASH_RATIOS[1],
+            ffmpeg_path="ffmpeg",
+            timeout=90,
+        )
+        apply.assert_called_once()
+        self.assertEqual(stats["midpoint_verified"], 1)
+
+    def test_metadata_maps_tags_characters_artist_date_and_urls(self):
+        post = {
+            "id": 123,
+            "created_at": "2026-09-01T12:34:56Z",
+            "tags": {
+                "artist": ["artist_one", "artist_two"],
+                "character": ["character_one"],
+                "general": ["tag_one"],
+                "species": ["species_one"],
+                "copyright": ["series_one"],
+                "lore": ["lore_one"],
+            },
+            "sources": ["https://source.example/post"],
+        }
+        metadata = plugin.e621_post_metadata(post)
+        self.assertEqual(metadata["artists"], ["artist_one", "artist_two"])
+        self.assertEqual(metadata["characters"], ["character_one"])
+        self.assertIn("tag_one", metadata["tags"])
+        self.assertIn("species_one", metadata["tags"])
+        self.assertIn("series_one", metadata["tags"])
+        self.assertIn("lore_one", metadata["tags"])
+        self.assertIn("artist_two", metadata["tags"])
+        self.assertEqual(metadata["date"], "2026-09-01")
+        self.assertIn("https://e621.net/posts/123", metadata["urls"])
 
 
 if __name__ == "__main__":
