@@ -1,6 +1,6 @@
 name: Booru Video Importer
-description: Separate scene/video matcher for e621 and Rule34. Supports exact MD5, local-first reverse search, and e621 source-first matching that compares early video frames against a cached local Stash frame index before full multi-frame verification.
-version: 1.2.0
+description: Stash-first exhaustive e621 video matcher. Processes one filtered local video at a time, rejects non-exact-duration e621 videos before opening media, verifies same-timecode frames, and imports authoritative e621 metadata on the first verified match.
+version: 2.0.0
 
 exec:
   - python
@@ -12,27 +12,22 @@ errLog: info
 settings:
   stash_tag_scope:
     displayName: Stash Tag Scope (any tag or alias)
-    description: Optional. Enter any existing Stash tag name or alias, for example furry. The plugin resolves it live against your Stash tags and processes only video scenes carrying that tag. Leave blank to process all eligible videos.
+    description: Optional. Enter any existing Stash tag name or alias, for example furry. Only local video scenes carrying that tag are processed. Leave blank to process all eligible local videos.
     type: STRING
 
   skip_organized_scenes:
     displayName: Protect Organized Scenes
-    description: When enabled, any Stash scene already marked Organized is skipped completely. The plugin will not add tags, performers, studio, URLs, dates, or workflow markers to that scene.
+    description: When enabled, any Stash scene already marked Organized is skipped completely and no metadata is changed.
     type: BOOLEAN
 
-  source_first_auto_import:
-    displayName: Allow Source-First Auto Import
-    description: Off by default for safety. When disabled, even high-confidence e621 source-first matches are sent to Booru Video Review instead of writing source metadata automatically.
-    type: BOOLEAN
-
-  e621_source_pages:
-    displayName: e621 Source-First Pages per Run
-    description: Number of historical e621 pages to inspect per run. Full runs remember a separate backward cursor for each Stash Tag Scope and continue older on the next run. Leave 0 or blank to use 5 pages.
+  e621_pages_per_run:
+    displayName: e621 History Pages per Stash Video per Run
+    description: Number of e621 video-history pages to scan for the current local video before saving progress. The next run resumes the same local file. Leave blank or 0 to use 10 pages.
     type: NUMBER
 
   e621_username:
     displayName: e621 username
-    description: Recommended. Enables authenticated e621 API requests and ERIS frame discovery.
+    description: Recommended for authenticated e621 API access.
     type: STRING
 
   e621_api_key:
@@ -40,87 +35,22 @@ settings:
     description: Recommended with the e621 username. Never written to plugin logs.
     type: STRING
 
-  rule34_user_id:
-    displayName: Rule34 user ID
-    description: Required for authoritative Rule34 post/tag metadata resolution.
-    type: STRING
-
-  rule34_api_key:
-    displayName: Rule34 API key
-    description: Required with the Rule34 user ID. Never written to plugin logs.
-    type: STRING
-
-  saucenao_api_key:
-    displayName: SauceNAO API key
-    description: Strongly recommended for Deep Reverse Search. SauceNAO is used only to locate e621/Rule34 candidate posts from video frames; metadata always comes from the source booru.
-    type: STRING
-
-  saucenao_requests_per_30_seconds:
-    displayName: SauceNAO searches per 30 seconds
-    description: Leave blank or 0 for Auto. The plugin learns the account short-term allowance from SauceNAO responses, including paid accounts. Set a positive number only to cap it lower.
-    type: NUMBER
-
 tasks:
-  - name: 1. Scan Unprocessed Videos (Fast)
-    description: Start here. Checks unclassified Stash scenes for exact video-file MD5 matches on e621 and Rule34. If Stash Tag Scope is set, only scenes carrying that tag are scanned. Exact video matches import metadata immediately; misses are queued as Booru Video Unresolved.
+  - name: Preview Next Stash Video Match (No Changes)
+    description: Takes the next eligible local Stash video and scans a limited e621 history window. Only exact-duration WebM/MP4 posts are opened. Same-timecode frames are compared, but no metadata or progress is changed.
     defaultArgs:
-      mode: import_all
-      lookup_mode: fast
-      dry_run: false
-
-  - name: 2. Preview Deep Reverse Search (10 Videos, No Changes)
-    description: Tests the next 10 unresolved videos without changing Stash. Extracts representative frames, locates e621/Rule34 candidates, and verifies actual candidate videos across multiple perceptual frame hashes.
-    defaultArgs:
-      mode: import_all
-      lookup_mode: deep
+      mode: match
       dry_run: true
-      limit: 10
+      pages_per_run: 1
+      local_limit: 1
 
-  - name: 3. Deep Reverse Search All Unresolved Videos
-    description: Runs frame-based reverse search only on Booru Video Unresolved scenes. Verified matches import authoritative tags, source URLs, date, characters as performers, and artist/studio metadata. Borderline multi-frame matches become Booru Video Review.
+  - name: Match Filtered Stash Videos Against e621
+    description: Main importer. Keeps one local Stash video active while walking all e621 WebM then MP4 history. Non-exact-duration posts are skipped before opening media. Exact-duration candidates are tested sequentially at the same timecodes until one verifies; metadata is imported on the first match. If e621 history is exhausted with no match, the next local video begins from newest.
     defaultArgs:
-      mode: import_all
-      lookup_mode: deep
+      mode: match
       dry_run: false
 
-  - name: 4. Recheck Video Review Candidates
-    description: Re-runs full video verification on scenes currently tagged Booru Video Review.
+  - name: Reset Matching Progress
+    description: Clears saved progress for the current Stash Tag Scope. The next run starts the first eligible local video from the newest e621 WebM history again.
     defaultArgs:
-      mode: import_all
-      lookup_mode: deep
-      dry_run: false
-      only_review: true
-
-  - name: 5. Retry Video No-Match Scenes
-    description: Rechecks scenes currently tagged Booru Video No Match after source indexes may have changed.
-    defaultArgs:
-      mode: import_all
-      lookup_mode: deep
-      dry_run: false
-      only_no_match: true
-
-  - name: 6. Build / Refresh Local Video Frame Index
-    description: Builds a cached early-frame hash index for eligible Stash scenes. If Stash Tag Scope is set, only scenes carrying that live Stash tag or alias are indexed. Unchanged files reuse cached hashes on later runs.
-    defaultArgs:
-      mode: build_source_index
-      force_index: false
-
-  - name: 7. Preview e621 Source-First Match (25 Posts, No Changes)
-    description: Previews up to 25 e621 video posts from the current saved history cursor without advancing it. e621 duration metadata must exactly match a local Stash duration after millisecond normalization before the remote video is ever opened.
-    defaultArgs:
-      mode: source_first_e621
-      dry_run: true
-      source_pages: 1
-      source_post_limit: 25
-
-  - name: 8. Continue e621 History Match to Local Stash
-    description: Continues backward through e621 video history for the selected Stash Tag Scope. Posts with missing duration or without an exact local millisecond-duration match are skipped before any remote frame/video scan. Progress is saved and the next run continues older.
-    defaultArgs:
-      mode: source_first_e621
-      dry_run: false
-
-  - name: 9. Reset e621 Source-First Cursor
-    description: Resets the saved e621 history position for the current Stash Tag Scope so the next source-first run starts from the newest e621 videos again. Use this after adding local videos when you want older already-scanned e621 history reconsidered.
-    defaultArgs:
-      mode: reset_source_cursor
-
+      mode: reset
