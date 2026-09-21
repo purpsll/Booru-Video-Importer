@@ -692,6 +692,19 @@ def post_metadata(source: str, post: Dict[str, Any], settings: Dict[str, Any]) -
     }
 
 
+def configured_stash_tag_scope(settings: Dict[str, Any]) -> str:
+    return " ".join(str(settings.get("stash_source_tag_filter") or "").split())
+
+
+def scene_has_tag_id(scene: Dict[str, Any], tag_id: Optional[str]) -> bool:
+    if not tag_id:
+        return True
+    return any(
+        str(tag.get("id") or "") == str(tag_id)
+        for tag in scene.get("tags") or []
+    )
+
+
 def skip_organized_enabled(settings: Dict[str, Any]) -> bool:
     return as_bool(settings.get("skip_organized_scenes"), False)
 
@@ -1678,6 +1691,17 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
     performer_cache = stash.all_performers()
     studio_cache = stash.all_studios()
 
+    scope_name = configured_stash_tag_scope(settings)
+    scope_tag_id: Optional[str] = None
+    scope_canonical_name: Optional[str] = None
+    if scope_name:
+        scope_tag = tag_cache.get(scope_name.casefold())
+        if not scope_tag:
+            raise RuntimeError(f"Stash tag scope not found: {scope_name}")
+        scope_tag_id = str(scope_tag.get("id") or "")
+        scope_canonical_name = str(scope_tag.get("name") or scope_name)
+        log("INFO", f"Video tagger scope: Stash tag '{scope_canonical_name}'")
+
     target_tag_id: Optional[str] = None
     if only_review:
         tag = ensure_tag(stash, STATUS_REVIEW, tag_cache)
@@ -1710,8 +1734,14 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         page = 1
         while True:
             count, scenes = stash.find_scenes(page, per_page, tag_id=target_tag_id)
+            had_page_rows = bool(scenes)
+            if scope_tag_id:
+                scenes = [
+                    scene for scene in scenes
+                    if scene_has_tag_id(scene, scope_tag_id)
+                ]
             queued.extend(scenes)
-            if page * per_page >= count or not scenes:
+            if page * per_page >= count or not had_page_rows:
                 break
             page += 1
 
@@ -1735,7 +1765,11 @@ def import_all(stash: Stash, settings: Dict[str, Any], args: Dict[str, Any]) -> 
         page = 1
         stop = False
         while not stop:
-            count, scenes = stash.find_scenes(page, per_page)
+            count, scenes = stash.find_scenes(
+                page,
+                per_page,
+                tag_id=scope_tag_id,
+            )
             if not scenes:
                 break
             for scene in scenes:
