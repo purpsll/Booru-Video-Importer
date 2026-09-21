@@ -7,7 +7,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 PLUGIN_ID = "BooruVideoImporter"
-USER_AGENT = "stash-booru-video-importer/2.1.0"
+USER_AGENT = "stash-booru-video-importer/3.0.0"
 
 
 def connection_endpoint(conn: Dict[str, Any]) -> str:
